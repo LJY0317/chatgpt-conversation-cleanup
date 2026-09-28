@@ -1,0 +1,50 @@
+# macOS / Python caches
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments
+.venv/
+venv/
+
+# Local maintainer context. These files are intentionally never published.
+AGENTS.md
+STATE.md
+
+# Private local ChatGPT/Codex state and recovery data.
+.archive-recovery/
+.recovery/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.session
+*.cookies
+*.cookie
+.auth/
+auth.json
+.codex/
+.codex-*/
+
+# Secrets and local environment configuration.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local portable-build outputs.
+build/
+dist/
+*.spec
+*.dmg
+*.app.zip
+*.exe
