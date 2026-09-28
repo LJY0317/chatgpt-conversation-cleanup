@@ -104,7 +104,7 @@ def assess_catalog_rows(
                 CatalogAssessment(
                     row=row,
                     status=ReconcileStatus.CONFIRMED,
-                    reason="The optional live check could not load this conversation twice.",
+                    reason="The current live check did not return this conversation twice.",
                 )
             )
             continue

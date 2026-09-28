@@ -12,7 +12,7 @@ This engine repairs the local ChatGPT Desktop conversation catalog. It does not 
 
 Each row receives an evidence status:
 
-- `confirmed`: strong structured deleted/not-found evidence, or an optional live provider that conclusively cannot load the conversation twice;
+- `confirmed`: strong structured deleted/not-found evidence, an optional live provider that conclusively cannot load the conversation twice, or a freshly advanced missing row from a newly completed build-verified Desktop full reconciliation;
 - `suspected`: Desktop's own `missing_candidate` signal without stronger proof;
 - `unknown`: no reliable automatic signal;
 - `protected`: a structured access/routing failure such as `conversation_inaccessible`;
@@ -21,6 +21,23 @@ Each row receives an evidence status:
 Only `confirmed` rows are preselected. `suspected` and `unknown` rows can be selected only from explicit manual review. `protected` and `present` rows cannot be selected.
 
 This makes the normal one-profile Desktop case independent of a debugging endpoint. A verified localhost CDP endpoint is an optional evidence provider, not a core requirement.
+
+### Desktop-owned fresh reconciliation
+
+The inspected Desktop runtime has separate incremental and full catalog scans. Incremental sync can advance history state without marking every unseen pre-existing row missing. A completed full scan can mark an unseen recent row `missing_candidate=1` and records `last_full_reconciled_at`. This distinction matters for ghosts that were created after the previous full scan and then disappeared while a delete/update notification was missed.
+
+For a refresh-verified official build, the cleanup utility can queue one fresh full scan without taking over Desktop's authenticated network path. While Desktop is stopped it:
+
+1. verifies the exact catalog schema, app build and a single `chatgpt:<account>:<user>` host for the signed-in workspace;
+2. sets only that host's `last_full_reconciled_at` to `NULL`;
+3. deletes only that host's transient scan checkpoint and seen-entry scratch rows;
+4. leaves every conversation row untouched.
+
+Clearing the stale checkpoint is essential. Desktop can otherwise resume an older incremental attempt before honoring the full-refresh marker. The host-scoped reset mirrors Desktop's own migration strategy for scheduling ChatGPT catalog backfills.
+
+After the user reopens ChatGPT, Desktop may still finish a newly started incremental pass first. The utility therefore never treats "refresh requested" as evidence. It waits until it observes both a newer observation sequence and a `last_full_reconciled_at` timestamp newer than the request. Only then does it re-read the catalog. Existing visible rows are protective `present` evidence. A missing row is promoted to automatic local-cleanup evidence only when its own `observation_sequence` advanced past the pre-refresh sequence while it was marked missing. A historical missing flag that was not touched by this reconciliation remains only `suspected`. Structured `conversation_inaccessible` remains a veto even if the fresh list omits that row.
+
+This path is currently restricted to the verified official-profile lifecycle. Multi-profile providers remain on the existing evidence/manual-review path until their launch, process ownership and catalog-refresh contracts are separately verified.
 
 ### Local-only mutation
 

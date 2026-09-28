@@ -50,6 +50,9 @@ class PlatformAdapter:
     def catalog_write_gate(self) -> tuple[bool, str]:
         return False, f"Direct catalog cleanup is not verified on {self.display_name}."
 
+    def catalog_refresh_gate(self) -> tuple[bool, str]:
+        return False, f"Desktop catalog refresh is not verified on {self.display_name}."
+
 
 @dataclass(frozen=True)
 class MacOSAdapter(PlatformAdapter):
@@ -123,6 +126,19 @@ class MacOSAdapter(PlatformAdapter):
             return False, "ChatGPT app build could not be verified."
         return False, f"ChatGPT build {current[0]} ({current[1]}) is not write-verified."
 
+    def catalog_refresh_gate(self) -> tuple[bool, str]:
+        # The refresh contract depends on internal Desktop sync semantics, so it
+        # stays narrower than the ordinary catalog-write gate.
+        verified = {("26.924.22138", "11645")}
+        current = self.app_build()
+        if current in verified:
+            return True, f"refresh-verified ChatGPT build {current[0]} ({current[1]})"
+        if current is None:
+            return False, "ChatGPT app build could not be verified for refresh."
+        return False, (
+            f"ChatGPT build {current[0]} ({current[1]}) is not refresh-verified."
+        )
+
 
 @dataclass(frozen=True)
 class WindowsAdapter(PlatformAdapter):
@@ -167,6 +183,9 @@ class WindowsAdapter(PlatformAdapter):
 
     def catalog_write_gate(self) -> tuple[bool, str]:
         return False, "Windows direct catalog cleanup is read-only until a build is verified."
+
+    def catalog_refresh_gate(self) -> tuple[bool, str]:
+        return False, "Windows Desktop catalog refresh is not yet build-verified."
 
 
 def current_platform(*, home: Path | None = None) -> PlatformAdapter:

@@ -25,6 +25,10 @@ from .core import (
 )
 from .codex_delete import execute_codex_delete_plan, preview_codex_delete
 from .desktop_probe import Presence, probe_conversation_presence
+from .desktop_refresh import (
+    desktop_catalog_refresh_result,
+    prepare_desktop_catalog_refresh,
+)
 from .evidence import (
     SAFE_CLEANUP_ERROR_CODES,
     desktop_failure_evidence,
@@ -80,7 +84,7 @@ def show(rows, *, kind):
             updated = _date(row.get("updated_at"))
         else:
             status = (
-                "Deleted or not found in ChatGPT"
+                "Confirmed stale in ChatGPT Desktop"
                 if row.get("classification") == "confirmed-missing"
                 else "Could not be loaded from ChatGPT"
                 if row.get("classification") == "not-loadable"
@@ -435,14 +439,14 @@ def _probe_presence_for_failures(
     )
 
 
-def _current_workspace_ids(profile, rows):
+def _current_workspace_host_id(profile, rows):
     account_id = (
         profile.identity.workspace_account_id
         if profile.identity is not None
         else None
     )
     if not account_id:
-        return set()
+        return None
     matched = set()
     for row in rows:
         host_id = row.get("host_id")
@@ -450,8 +454,19 @@ def _current_workspace_ids(profile, rows):
             continue
         parts = host_id.split(":", 2)
         if len(parts) == 3 and parts[0] == "chatgpt" and parts[1] == account_id:
-            matched.add(row["thread_id"])
-    return matched
+            matched.add(host_id)
+    return next(iter(matched)) if len(matched) == 1 else None
+
+
+def _current_workspace_ids(profile, rows):
+    host_id = _current_workspace_host_id(profile, rows)
+    if host_id is None:
+        return set()
+    return {
+        row["thread_id"]
+        for row in rows
+        if row.get("host_id") == host_id
+    }
 
 
 def _cleanup_candidates(
@@ -626,6 +641,163 @@ def _cleanup_candidates_batch(
     }
 
 
+def _desktop_refresh_offer(profile, assessments, platform):
+    if not assessments or profile.provider != "official" or profile.identity is None:
+        return None
+    account_id = profile.identity.workspace_account_id
+    if not account_id:
+        return None
+    write_gate = getattr(platform, "catalog_write_gate", None)
+    refresh_gate = getattr(platform, "catalog_refresh_gate", None)
+    if write_gate is None or refresh_gate is None:
+        return None
+    if not write_gate()[0] or not refresh_gate()[0]:
+        return None
+    host_id = _current_workspace_host_id(
+        profile, [item.row for item in assessments]
+    )
+    if host_id is None:
+        return None
+    uncertain_count = sum(
+        item.row.get("host_id") == host_id
+        and item.status in {ReconcileStatus.SUSPECTED, ReconcileStatus.UNKNOWN}
+        for item in assessments
+    )
+    if uncertain_count == 0:
+        return None
+    return account_id, host_id, uncertain_count
+
+
+def _apply_desktop_refresh_result(profile, assessments, result):
+    before_ids = {
+        item.row["thread_id"]
+        for item in assessments
+        if item.row.get("host_id") == result.host_id
+    }
+    old_by_key = {
+        (item.row.get("host_id"), item.row["thread_id"]): item
+        for item in assessments
+    }
+    current_rows = chatgpt_catalog(profile)
+    after_ids = {
+        row["thread_id"]
+        for row in current_rows
+        if row.get("host_id") == result.host_id
+    }
+    updated = []
+    for row in current_rows:
+        key = (row.get("host_id"), row["thread_id"])
+        old = old_by_key.get(key)
+        if old is None:
+            old = assess_catalog_rows([row], {}, None)[0]
+        if row.get("host_id") != result.host_id:
+            updated.append(
+                CatalogAssessment(row=row, status=old.status, reason=old.reason)
+            )
+            continue
+        thread_id = row["thread_id"]
+        if thread_id in result.present_ids:
+            updated.append(
+                CatalogAssessment(
+                    row=row,
+                    status=ReconcileStatus.PRESENT,
+                    reason="A fresh ChatGPT Desktop reconciliation still returned this chat.",
+                )
+            )
+        elif (
+            thread_id in result.missing_ids
+            and old.status != ReconcileStatus.PROTECTED
+        ):
+            updated.append(
+                CatalogAssessment(
+                    row=row,
+                    status=ReconcileStatus.CONFIRMED,
+                    reason=(
+                        "A fresh ChatGPT Desktop full reconciliation did not return "
+                        "this local chat."
+                    ),
+                )
+            )
+        else:
+            updated.append(
+                CatalogAssessment(row=row, status=old.status, reason=old.reason)
+            )
+    return updated, before_ids - after_ids, result.missing_ids & after_ids
+
+
+def _maybe_refresh_desktop_assessments(
+    profile,
+    assessments,
+    platform,
+    *,
+    refresh_prepare=prepare_desktop_catalog_refresh,
+    refresh_result=desktop_catalog_refresh_result,
+):
+    """Offer a Desktop-owned fresh reconciliation for still-uncertain rows.
+
+    This is deliberately an interactive, official-provider path. The normal
+    single-profile app is the default; alternate profile runtimes keep their
+    existing evidence/manual-review path until their launch/lifecycle contract
+    is independently verified.
+    """
+
+    offer = _desktop_refresh_offer(profile, assessments, platform)
+    if offer is None:
+        return list(assessments)
+    account_id, _host_id, uncertain_count = offer
+    answer = input(
+        f"\n{profile.display_name}: {uncertain_count} local chat(s) are still uncertain. "
+        "ChatGPT Desktop can do a fresh server reconciliation itself. "
+        "This can take several minutes and requires closing and reopening ChatGPT once. "
+        "Press Y to run it, or Enter to continue without it: "
+    ).strip().lower()
+    if answer not in {"y", "yes"}:
+        return list(assessments)
+
+    if not _wait_for_desktop_to_close(platform, purpose="refresh"):
+        return list(assessments)
+
+    request = refresh_prepare(profile, account_id, platform)
+    print(
+        "\nFresh reconciliation queued. Open ChatGPT now and leave it open. "
+        "Desktop may finish an incremental pass before the full pass, so this can "
+        "take several minutes."
+    )
+    while True:
+        answer = input(
+            "Press Enter to check whether Desktop finished, or S to stop waiting: "
+        ).strip().lower()
+        if answer in {"s", "stop", "c", "cancel"}:
+            print(
+                "Stopped waiting. No conversation row was changed by this utility. "
+                "The queued Desktop refresh can continue the next time ChatGPT runs."
+            )
+            return list(assessments)
+        result = refresh_result(profile, request, platform)
+        if result is not None:
+            break
+        print(
+            "Desktop has not completed the fresh full reconciliation yet. "
+            "Leave ChatGPT open for a while longer, then check again."
+        )
+
+    updated, removed, newly_missing = _apply_desktop_refresh_result(
+        profile, assessments, result
+    )
+    print("Fresh ChatGPT Desktop reconciliation finished.")
+    if removed:
+        print(
+            f"Desktop already removed {len(removed)} stale local entr"
+            f"{'y' if len(removed) == 1 else 'ies'} during reconciliation."
+        )
+    if newly_missing:
+        print(
+            f"{len(newly_missing)} remaining local chat(s) were freshly confirmed "
+            "absent from Desktop's current active history and can be preselected."
+        )
+    return updated
+
+
 def _collect_work(
     action,
     profiles,
@@ -653,12 +825,15 @@ def _collect_work(
             selected = choose(rows, kind="archived", default_all=True)
         else:
             assessments = catalog_assessments.get(profile.id, [])
+            assessments = _maybe_refresh_desktop_assessments(
+                profile, assessments, platform
+            )
             selected = choose_cleanup_assessments(assessments)
         work.append((profile, selected))
     return work
 
 
-def _wait_for_desktop_to_close(platform):
+def _wait_for_desktop_to_close(platform, *, purpose="cleanup"):
     first = True
     while True:
         try:
@@ -666,16 +841,22 @@ def _wait_for_desktop_to_close(platform):
             return True
         except PlatformError:
             if first:
-                print(
-                    "\nQuit ChatGPT before the cleanup is applied. "
-                    "Your selection is ready."
-                )
+                if purpose == "refresh":
+                    print(
+                        "\nQuit ChatGPT so a fresh Desktop reconciliation can be queued. "
+                        "No conversation row will be edited while ChatGPT is open."
+                    )
+                else:
+                    print(
+                        "\nQuit ChatGPT before the cleanup is applied. "
+                        "Your selection is ready."
+                    )
                 first = False
             answer = input(
                 "When ChatGPT is fully closed, press Enter to continue, "
                 "or C to cancel: "
             ).strip().lower()
-            if answer == "c":
+            if answer in {"c", "cancel"}:
                 return False
 
 
@@ -767,6 +948,13 @@ def doctor_data(profile, platform):
     writable, reason = platform.catalog_write_gate()
     data["catalog_write_enabled"] = writable
     data["catalog_write_gate"] = reason
+    refresh_gate = getattr(platform, "catalog_refresh_gate", None)
+    if refresh_gate is None:
+        refreshable, refresh_reason = False, "Desktop catalog refresh is unavailable."
+    else:
+        refreshable, refresh_reason = refresh_gate()
+    data["catalog_refresh_enabled"] = refreshable and writable
+    data["catalog_refresh_gate"] = refresh_reason
     return data
 
 
@@ -783,6 +971,12 @@ def doctor(profile, platform):
     print(f"  Local cleanup: {'available' if data['catalog_write_enabled'] else 'read-only'}")
     if not data["catalog_write_enabled"]:
         print(f"  Why: {data['catalog_write_gate']}")
+    print(
+        "  Fresh Desktop reconciliation: "
+        + ("available" if data["catalog_refresh_enabled"] else "unavailable")
+    )
+    if not data["catalog_refresh_enabled"]:
+        print(f"  Refresh gate: {data['catalog_refresh_gate']}")
 
 
 def recovery_menu(profile, platform):

@@ -102,7 +102,7 @@ Option 1 is a **reconciliation tool**, not a perfect ghost detector. The local C
 
 Each local ChatGPT row is classified into one of these states:
 
-- **Confirmed leftover** — Desktop recorded a structured deleted/not-found result, or an optional live verifier conclusively failed to load the conversation twice. These are preselected.
+- **Confirmed leftover** — Desktop recorded a structured deleted/not-found result, an optional live verifier conclusively failed to load the conversation twice, or a newly completed build-verified Desktop full reconciliation freshly marked the row missing. These are preselected for **local** cleanup.
 - **Possible leftover** — Desktop's own `missing_candidate` flag is set, but there is not enough evidence to call the row deleted. These are visible in review but not preselected.
 - **Not verified** — no reliable automatic signal is available. These rows are still visible in manual review instead of being silently hidden.
 - **Protected — access issue** — Desktop reported `conversation_inaccessible`. Project/workspace routing can produce this for a live conversation, so the row cannot be selected by this tool.
@@ -111,6 +111,8 @@ Each local ChatGPT row is classified into one of these states:
 This matters for the normal single-profile ChatGPT Desktop app: mainstream builds do not necessarily expose a localhost debugging endpoint. Live verification is therefore **optional supplemental evidence**, never a prerequisite for listing or reviewing local rows. Verified multi-profile runtimes that explicitly expose a profile-scoped localhost debugging endpoint can provide stronger evidence, but the core cleanup flow does not depend on that capability.
 
 When the optional live provider is available, it uses the running Desktop renderer's own `/conversations/batch` capability. IDs are checked in the same maximum batch size used by Desktop, batches are sent sequentially with pacing, only omitted IDs are checked a second time, and HTTP 429 abandons the live result immediately. The tool never launches ChatGPT with debugging flags just to gain this capability.
+
+On a specifically refresh-verified official Desktop build, uncertain rows can instead be handed back to **ChatGPT Desktop's own catalog synchronizer**. The utility asks you to close ChatGPT, clears only the host's full-refresh scheduling marker plus stale scan checkpoint/seen scratch state, and then asks you to reopen ChatGPT and leave it open. Desktop performs the authenticated history requests and owns every resulting catalog change. This can take several minutes because Desktop may finish an incremental pass before the requested full pass. The utility trusts the result only after it observes a newer completed full reconciliation and a newer catalog observation sequence. A historical `missing_candidate=1` is never upgraded merely because some later full scan completed; the row itself must have been freshly advanced by that reconciliation.
 
 Structured Desktop logs are another optional evidence source. Only definite deleted/not-found codes can preselect a row. `missing_candidate` is treated as a suspicion signal, not truth. `conversation_inaccessible` is a protection signal, not deletion evidence.
 
@@ -124,12 +126,13 @@ Local-list cleanup follows this order:
 2. scan each selected profile independently;
 3. collect structured evidence and optional live evidence when available;
 4. classify every local ChatGPT row instead of hiding unverified rows;
-5. preselect confirmed leftovers or explicitly review/select local entries;
-6. ask the user to quit ChatGPT normally;
-7. require a final explicit confirmation;
-8. re-read and compare the exact selected catalog rows inside the write path;
-9. create a private recovery record;
-10. apply the same authoritative-removal bookkeeping used by the current Desktop catalog: advance the host observation sequence, preserve a scan tombstone when a checkpoint exists, remove only the exact row, and advance the catalog revision when a visible row was removed.
+5. when supported and useful, optionally queue a fresh Desktop-owned full reconciliation for still-uncertain official-profile rows, then re-read the catalog only after that full pass is proven complete;
+6. preselect confirmed local leftovers or explicitly review/select local entries;
+7. ask the user to quit ChatGPT normally before cleanup is applied;
+8. require a final explicit confirmation;
+9. re-read and compare the exact selected catalog rows inside the write path;
+10. create a private recovery record;
+11. apply the same authoritative-removal bookkeeping used by the current Desktop catalog: advance the host observation sequence, preserve a scan tombstone when a checkpoint exists, remove only the exact row, and advance the catalog revision when a visible row was removed.
 
 The server is not queried a second time after selection. This avoids bursty duplicate reads and leaves the destructive safety check to the exact local-row comparison immediately before the write.
 
@@ -149,15 +152,15 @@ Archived Codex deletion is a separate engine:
 
 One profile: no profile selector is shown.
 
-Several verified profiles: one operation can target multiple profiles. Each profile is still previewed, revalidated and applied sequentially. Arbitrary `.codex-*` directories are not trusted as profiles merely because they exist.
+Several verified profiles: one operation can target multiple profiles. Each profile is still previewed, revalidated and applied sequentially. Arbitrary `.codex-*` directories are not trusted as profiles merely because they exist. The fresh Desktop-owned reconciliation path is currently intentionally limited to the verified official-profile lifecycle; alternate profile providers keep the existing evidence/manual-review flow until their launch and sync ownership contracts are independently verified.
 
 ## Safety boundary
 
-- A ChatGPT local catalog entry, `missing_candidate` flag, `conversation_inaccessible` result, or Native-state absence is not proof that the server conversation was deleted. Uncertain rows require explicit manual review.
+- A ChatGPT local catalog entry, a standalone/historical `missing_candidate` flag, `conversation_inaccessible` result, or Native-state absence is not proof that the server conversation was deleted. Uncertain rows require explicit manual review. Fresh Desktop reconciliation evidence is accepted only after a newer full pass completes, and only a row whose own observation sequence advanced while being marked missing can gain automatic local-cleanup confidence; `conversation_inaccessible` remains protected.
 - Native Codex history/lineage, authentication and provider tables are never rewritten directly. Archived Codex deletion delegates the irreversible operation to official app-server `thread/delete` and uses local state only for preview, dependency planning and verification.
 - Direct catalog mutation requires an exact known schema and a platform/build write gate.
 - Preview changes, profile/account mismatch, unknown schemas/builds, symlinks, recovery conflicts and ambiguous request/command results stop the operation.
-- ChatGPT/Codex Desktop must be closed normally before destructive operations. The optional live read-only scan may run while ChatGPT is open; the tool then waits for the user to close it. For archived deletion, the utility starts its own short-lived official Codex app-server over stdio after Desktop is closed and releases it by closing stdio when the operation ends.
+- ChatGPT/Codex Desktop must be closed normally before destructive operations. The optional live read-only scan may run while ChatGPT is open; the tool then waits for the user to close it. A supported fresh reconciliation also briefly requires Desktop to be closed while only its sync scheduling/scratch state is reset; the user then reopens Desktop and Desktop itself performs the network reconciliation. For archived deletion, the utility starts its own short-lived official Codex app-server over stdio after Desktop is closed and releases it by closing stdio when the operation ends.
 - Recovery files may contain conversation metadata and are stored privately outside the repository.
 - Tests use synthetic homes only. Real user conversations are not deleted for testing.
 

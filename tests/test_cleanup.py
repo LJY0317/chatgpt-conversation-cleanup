@@ -259,6 +259,34 @@ class CleanupTests(unittest.TestCase):
             adapter = WindowsAdapter(home=self.home)
             self.assertFalse(adapter.catalog_write_gate()[0])
 
+    def test_macos_refresh_gate_is_narrower_than_catalog_write_gate(self):
+        app = self.home / "ChatGPT.app/Contents"
+        app.mkdir(parents=True)
+        info = app / "Info.plist"
+        with patch.dict(os.environ, {"CHATGPT_CLEANUP_APP": str(app.parent)}):
+            info.write_bytes(
+                plistlib.dumps(
+                    {
+                        "CFBundleShortVersionString": "26.924.22138",
+                        "CFBundleVersion": "11645",
+                    }
+                )
+            )
+            adapter = MacOSAdapter(home=self.home)
+            self.assertTrue(adapter.catalog_write_gate()[0])
+            self.assertTrue(adapter.catalog_refresh_gate()[0])
+
+            info.write_bytes(
+                plistlib.dumps(
+                    {
+                        "CFBundleShortVersionString": "26.915.31945",
+                        "CFBundleVersion": "9922",
+                    }
+                )
+            )
+            self.assertTrue(adapter.catalog_write_gate()[0])
+            self.assertFalse(adapter.catalog_refresh_gate()[0])
+
     def test_sessions_expose_identity_metadata_when_available(self):
         row = c.sessions(self.profile)[0]
         self.assertEqual(row["creator_user_id"], "user-test")
