@@ -32,6 +32,14 @@ def require_desktop_catalog_refresh(platform: PlatformAdapter) -> None:
     require(supported, reason)
 
 
+def _require_profile_stopped(profile: Profile, platform: PlatformAdapter) -> None:
+    checker = getattr(platform, "require_profile_desktop_stopped", None)
+    if checker is None:
+        platform.require_desktop_stopped()
+    else:
+        checker(profile)
+
+
 def _workspace_host(db, account_id: str) -> str:
     hosts = []
     for row in db.execute(
@@ -65,7 +73,7 @@ def prepare_desktop_catalog_refresh(
 
     require_desktop_catalog_refresh(platform)
     require(bool(account_id), "The signed-in ChatGPT workspace could not be identified.")
-    platform.require_desktop_stopped()
+    _require_profile_stopped(profile, platform)
 
     path = profile.root / "sqlite/codex-dev.db"
     with database(path, profile.root, write=True) as db:
@@ -75,7 +83,7 @@ def prepare_desktop_catalog_refresh(
             # Re-check while holding the write transaction. This narrows the
             # process/SQLite race: if Desktop appeared after the outer check,
             # the scheduling-state mutation is rolled back instead of racing it.
-            platform.require_desktop_stopped()
+            _require_profile_stopped(profile, platform)
             host_id = _workspace_host(db, account_id)
             state = db.execute(
                 "SELECT observation_sequence,last_full_reconciled_at "
@@ -117,7 +125,7 @@ def prepare_desktop_catalog_refresh(
                 db.execute("PRAGMA quick_check").fetchone()[0] == "ok",
                 "Database verification failed while queuing Desktop refresh.",
             )
-            platform.require_desktop_stopped()
+            _require_profile_stopped(profile, platform)
             db.commit()
         except BaseException:
             db.rollback()

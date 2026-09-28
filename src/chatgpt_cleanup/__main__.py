@@ -771,7 +771,7 @@ def _maybe_refresh_desktop_assessments(
             return list(assessments)
         print("Press Enter/R to refresh, or S to skip.")
 
-    if not _wait_for_desktop_to_close(platform, purpose="refresh"):
+    if not _wait_for_desktop_to_close(platform, purpose="refresh", profile=profile):
         return list(assessments)
 
     request = refresh_prepare(profile, account_id, platform)
@@ -850,11 +850,18 @@ def _collect_work(
     return work
 
 
-def _wait_for_desktop_to_close(platform, *, purpose="cleanup"):
+def _wait_for_desktop_to_close(platform, *, purpose="cleanup", profile=None):
     first = True
     while True:
         try:
-            platform.require_desktop_stopped()
+            if profile is not None:
+                checker = getattr(platform, "require_profile_desktop_stopped", None)
+                if checker is None:
+                    platform.require_desktop_stopped()
+                else:
+                    checker(profile)
+            else:
+                platform.require_desktop_stopped()
             return True
         except PlatformError:
             if first:

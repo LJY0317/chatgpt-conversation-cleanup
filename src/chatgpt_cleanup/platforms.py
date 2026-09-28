@@ -7,6 +7,10 @@ import plistlib
 import shutil
 import subprocess
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .profiles import Profile
 
 
 class PlatformError(RuntimeError):
@@ -46,6 +50,11 @@ class PlatformAdapter:
 
     def require_desktop_stopped(self) -> None:
         raise NotImplementedError
+
+    def require_profile_desktop_stopped(self, profile: "Profile") -> None:
+        # Platforms without a verified per-profile process contract keep the
+        # conservative all-Desktop guard.
+        self.require_desktop_stopped()
 
     def catalog_write_gate(self) -> tuple[bool, str]:
         return False, f"Direct catalog cleanup is not verified on {self.display_name}."
@@ -100,6 +109,67 @@ class MacOSAdapter(PlatformAdapter):
             if "/Contents/MacOS/ChatGPT" in line or ("codex" in line and "app-server" in line):
                 raise PlatformError(
                     "Quit ChatGPT and Codex app-server normally before applying changes."
+                )
+
+    def require_profile_desktop_stopped(self, profile: "Profile") -> None:
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        official_executable = str(self.app_path / "Contents/MacOS/ChatGPT")
+        data_root = profile.desktop_data_root
+        marker = f"--user-data-dir={data_root}" if data_root is not None else None
+        for raw in result.stdout.splitlines():
+            parts = raw.strip().split(maxsplit=1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            pid, line = parts
+            if "codex" in line and "app-server" in line:
+                # Alternate profile launchers can run an app-server from the
+                # official app bundle while pointing CODEX_HOME at their own
+                # isolated profile root. Inspect only that process's environment
+                # so an unrelated profile does not block this profile's refresh.
+                try:
+                    detailed = subprocess.run(
+                        ["/bin/ps", "eww", "-p", pid, "-o", "command="],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout
+                except (OSError, subprocess.SubprocessError):
+                    raise PlatformError(
+                        "Could not verify which ChatGPT profile owns Codex app-server."
+                    )
+                codex_home = f"CODEX_HOME={profile.root}"
+                home_tokens = [
+                    token
+                    for token in detailed.split()
+                    if token.startswith("CODEX_HOME=")
+                ]
+                if home_tokens and codex_home not in home_tokens:
+                    continue
+                raise PlatformError(
+                    f"Quit {profile.display_name}'s Codex app-server normally before applying changes."
+                )
+            if "/Contents/MacOS/ChatGPT" not in line:
+                continue
+            if profile.provider == "official":
+                # The official app can also be hosted by developer runtimes. If
+                # it points at the same Desktop user-data root, it owns the same
+                # catalog and must be stopped before scheduling refresh.
+                if (
+                    line == official_executable
+                    or line.startswith(official_executable + " ")
+                ) and (marker is None or marker in line or "--user-data-dir=" not in line):
+                    raise PlatformError(
+                        f"Quit {profile.display_name} normally before applying changes."
+                    )
+                continue
+            if marker is not None and marker in line:
+                raise PlatformError(
+                    f"Quit {profile.display_name} normally before applying changes."
                 )
 
     def app_build(self) -> tuple[str, str] | None:

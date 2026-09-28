@@ -287,6 +287,137 @@ class CleanupTests(unittest.TestCase):
             self.assertTrue(adapter.catalog_write_gate()[0])
             self.assertFalse(adapter.catalog_refresh_gate()[0])
 
+    def test_macos_profile_stop_guard_ignores_other_isolated_profile(self):
+        adapter = MacOSAdapter(home=self.home)
+        profile = Profile(
+            "default",
+            "ChatGPT",
+            self.root,
+            "official",
+            desktop_data_root=self.home / "Library/Application Support/Codex",
+        )
+        other_root = self.home / "Library/Application Support/Codex-Profile2"
+        other = (
+            self.home
+            / "Library/Application Support/PluraDesktop/runtime-apps/profile-2/"
+            "ChatGPT.app/Contents/MacOS/ChatGPT"
+        )
+        process = type(
+            "ProcessResult",
+            (),
+            {
+                "stdout": (
+                    f"123 {other} --user-data-dir={other_root} "
+                    "--remote-debugging-address=127.0.0.1\n"
+                )
+            },
+        )()
+        with patch(
+            "chatgpt_cleanup.platforms.subprocess.run",
+            return_value=process,
+        ):
+            adapter.require_profile_desktop_stopped(profile)
+
+        official = type(
+            "ProcessResult",
+            (),
+            {"stdout": "456 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n"},
+        )()
+        with (
+            patch(
+                "chatgpt_cleanup.platforms.subprocess.run",
+                return_value=official,
+            ),
+            self.assertRaisesRegex(Exception, "Quit ChatGPT"),
+        ):
+            adapter.require_profile_desktop_stopped(profile)
+
+    def test_macos_profile_stop_guard_ignores_other_profile_app_server(self):
+        adapter = MacOSAdapter(home=self.home)
+        profile = Profile(
+            "default",
+            "ChatGPT",
+            self.root,
+            "official",
+            desktop_data_root=self.home / "Library/Application Support/Codex",
+        )
+        listing = type(
+            "ProcessResult",
+            (),
+            {
+                "stdout": (
+                    "321 /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex "
+                    "app-server --listen ws://127.0.0.1:50000\n"
+                )
+            },
+        )()
+        detail = type(
+            "ProcessResult",
+            (),
+            {"stdout": f"codex app-server CODEX_HOME={self.home}/.codex-profile2\n"},
+        )()
+        with patch(
+            "chatgpt_cleanup.platforms.subprocess.run",
+            side_effect=[listing, detail],
+        ):
+            adapter.require_profile_desktop_stopped(profile)
+
+    def test_macos_profile_stop_guard_blocks_app_server_using_same_codex_home(self):
+        adapter = MacOSAdapter(home=self.home)
+        profile = Profile(
+            "default",
+            "ChatGPT",
+            self.root,
+            "official",
+            desktop_data_root=self.home / "Library/Application Support/Codex",
+        )
+        listing = type(
+            "ProcessResult",
+            (),
+            {"stdout": "321 /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex app-server\n"},
+        )()
+        detail = type(
+            "ProcessResult",
+            (),
+            {"stdout": f"codex app-server CODEX_HOME={self.root}\n"},
+        )()
+        with (
+            patch(
+                "chatgpt_cleanup.platforms.subprocess.run",
+                side_effect=[listing, detail],
+            ),
+            self.assertRaisesRegex(Exception, "Codex app-server"),
+        ):
+            adapter.require_profile_desktop_stopped(profile)
+
+    def test_macos_profile_stop_guard_blocks_official_desktop_app_server(self):
+        adapter = MacOSAdapter(home=self.home)
+        profile = Profile(
+            "default",
+            "ChatGPT",
+            self.root,
+            "official",
+            desktop_data_root=self.home / "Library/Application Support/Codex",
+        )
+        listing = type(
+            "ProcessResult",
+            (),
+            {"stdout": "321 /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex app-server\n"},
+        )()
+        detail = type(
+            "ProcessResult",
+            (),
+            {"stdout": f"codex app-server CODEX_HOME={self.root}\n"},
+        )()
+        with (
+            patch(
+                "chatgpt_cleanup.platforms.subprocess.run",
+                side_effect=[listing, detail],
+            ),
+            self.assertRaisesRegex(Exception, "Codex app-server"),
+        ):
+            adapter.require_profile_desktop_stopped(profile)
+
     def test_sessions_expose_identity_metadata_when_available(self):
         row = c.sessions(self.profile)[0]
         self.assertEqual(row["creator_user_id"], "user-test")

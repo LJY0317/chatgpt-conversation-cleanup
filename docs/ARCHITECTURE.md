@@ -36,7 +36,7 @@ This separation is required, not cosmetic. Live validation showed that feeding W
 
 The inspected Desktop runtime has separate incremental and full catalog scans. Incremental sync can advance history state without marking every unseen pre-existing row missing. A completed full scan can mark an unseen recent row `missing_candidate=1` and records `last_full_reconciled_at`. This distinction matters for ghosts that were created after the previous full scan and then disappeared while a delete/update notification was missed.
 
-For a refresh-verified official build, the cleanup utility can queue one fresh full scan without taking over Desktop's authenticated network path. While Desktop is stopped it:
+For a refresh-verified official build, the cleanup utility can queue one fresh full scan without taking over Desktop's authenticated network path. While that selected profile's Desktop process is stopped it:
 
 1. verifies the exact catalog schema, app build and a single `chatgpt:<account>:<user>` host for the signed-in workspace;
 2. sets only that host's `last_full_reconciled_at` to `NULL`;
@@ -48,6 +48,8 @@ Clearing the stale checkpoint is essential. Desktop can otherwise resume an olde
 After the user reopens ChatGPT, Desktop may still finish a newly started incremental pass first. The utility therefore never treats "refresh requested" as evidence. It waits until it observes both a newer observation sequence and a `last_full_reconciled_at` timestamp newer than the request. Only then does it re-read the catalog. Existing visible rows are protective `present` evidence. A missing row is promoted to automatic local-cleanup evidence only when its own `observation_sequence` advanced past the pre-refresh sequence while it was marked missing. A historical missing flag that was not touched by this reconciliation remains only `suspected`. Structured `conversation_inaccessible` remains a veto even if the fresh list omits that row.
 
 This path is currently restricted to the verified official-profile lifecycle. Multi-profile providers remain on the existing evidence/manual-review path until their launch, process ownership and catalog-refresh contracts are separately verified.
+
+The stop guard used by refresh is profile-scoped on macOS. A verified alternate runtime with its own `--user-data-dir`/`CODEX_HOME` and separate catalog may stay open while the official profile is queued, avoiding an unrelated second profile blocking reconciliation. A developer runtime that points at the selected profile's same Desktop data root or Codex home is treated as a co-owner and must stop. Destructive local cleanup keeps the stricter all-Desktop stop guard.
 
 ### Local-only mutation
 
