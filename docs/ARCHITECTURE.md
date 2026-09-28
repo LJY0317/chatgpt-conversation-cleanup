@@ -22,6 +22,16 @@ Only `confirmed` rows are preselected. `suspected` and `unknown` rows can be sel
 
 This makes the normal one-profile Desktop case independent of a debugging endpoint. A verified localhost CDP endpoint is an optional evidence provider, not a core requirement.
 
+### Category-aware current-session verification
+
+The ChatGPT catalog contains several server-side conversation surfaces that cannot safely share one presence probe. The inspected Desktop build stores enough routing metadata on each row to keep them separate:
+
+- ordinary global chats (`project_id IS NULL`, non-`tpp`) use `POST /conversations/batch`, in the same maximum batch size of 10 used by Desktop;
+- Work chats (`conversation_origin='tpp'`) use the paginated active `/conversations` inventory filtered to `tpp`;
+- Project chats use the paginated `/gizmos/{gizmo_id}/conversations` inventory for their exact `g-p-*` project.
+
+This separation is required, not cosmetic. Live validation showed that feeding Work or Project IDs through the ordinary batch route can fail the whole mixed request even though the ordinary global IDs are valid. The verifier therefore classifies categories independently, paces pages/requests, and rechecks an omission before accepting it as local-cleanup evidence. A non-rate-limit failure makes only the affected category `unverified`; a 429 discards all partial live evidence. `conversation_inaccessible` from structured Desktop evidence remains a protection veto.
+
 ### Desktop-owned fresh reconciliation
 
 The inspected Desktop runtime has separate incremental and full catalog scans. Incremental sync can advance history state without marking every unseen pre-existing row missing. A completed full scan can mark an unseen recent row `missing_candidate=1` and records `last_full_reconciled_at`. This distinction matters for ghosts that were created after the previous full scan and then disappeared while a delete/update notification was missed.

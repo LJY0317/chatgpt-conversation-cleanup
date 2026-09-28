@@ -385,7 +385,7 @@ class DesktopRefreshTests(unittest.TestCase):
             )
 
         with (
-            patch("builtins.input", side_effect=["y", ""]),
+            patch("builtins.input", side_effect=["", ""]),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             updated = _maybe_refresh_desktop_assessments(

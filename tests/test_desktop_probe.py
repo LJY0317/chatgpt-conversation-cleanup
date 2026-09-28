@@ -167,12 +167,29 @@ class DesktopProbeTests(unittest.TestCase):
         self.assertIn("conversation_request_alias_unavailable", expression)
         self.assertIn("conversation_request_export_unavailable", expression)
         self.assertIn("rateLimited", expression)
-        self.assertIn("status===429", expression)
+        self.assertIn("statusOf(error)===429", expression)
         self.assertIn("slice(index,index+10)", expression)
-        self.assertIn("setTimeout(resolve,750)", expression)
-        self.assertIn("setTimeout(resolve,1250)", expression)
+        self.assertIn("pause(750)", expression)
+        self.assertIn("pause(1250)", expression)
         self.assertIn("secondPresent.has(id)?'unverified':'missing'", expression)
         self.assertNotIn("Promise.all", expression)
+
+    def test_probe_expression_routes_work_and_project_conversations_separately(self):
+        expression = _probe_expression(
+            ["plain", "work", "project"],
+            route_hints={
+                "work": {"conversation_origin": "tpp"},
+                "project": {"project_id": "g-p-project"},
+            },
+        )
+        self.assertIn('"conversationOrigin":"tpp"', expression)
+        self.assertIn('"projectId":"g-p-project"', expression)
+        self.assertIn("/gizmos/{gizmo_id}/conversations", expression)
+        self.assertIn("conversation_origin:origin", expression)
+        self.assertIn("listOrigin('tpp')", expression)
+        self.assertIn("owned_only:false", expression)
+        self.assertIn("limit:50", expression)
+        self.assertIn("classifyInventory", expression)
 
     def test_presence_results_are_strictly_parsed(self):
         target = CdpTarget(50747, "ws://127.0.0.1:50747/devtools/page/test")

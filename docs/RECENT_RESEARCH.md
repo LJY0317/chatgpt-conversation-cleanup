@@ -24,6 +24,8 @@ Static inspection showed that incremental and full catalog scans have materially
 
 The production design therefore mirrors that host-scoped scheduling contract while Desktop is stopped: clear the full-refresh marker plus transient checkpoint/seen scratch state, but never edit conversation rows to manufacture evidence. After the user reopens Desktop, the utility waits for a genuinely newer completed full reconciliation. Fresh missing evidence is accepted only for rows whose own observation sequence advanced after the request; historical missing flags remain uncertain. This keeps the authenticated network operation and catalog ownership inside Desktop and avoids persisting or replaying session credentials.
 
+A later real-session validation exposed a second source of false uncertainty: `/conversations/batch` is appropriate for ordinary global chats, but Work (`conversation_origin=tpp`) and Project (`g-p-*`) rows have separate inventory surfaces. Mixing those rows into one batch probe could fail closed for the entire profile. The current verifier now uses the active `tpp` history inventory for Work chats and each project's `/gizmos/{gizmo_id}/conversations` inventory for Project chats, while keeping ordinary chats on the batch route. Each omission is rechecked, category failures are isolated, and 429 still cancels all partial live evidence.
+
 ## Archived Codex deletion
 
 Recent repositories inspected:

@@ -425,17 +425,28 @@ def _probe_presence_for_failures(
     platform,
     failures,
     presence_probe,
+    *,
+    rows=None,
 ):
     inaccessible_ids = {
         thread_id
         for thread_id, evidence in failures.items()
         if evidence.error_code == "conversation_inaccessible"
     }
+    route_hints = {
+        row["thread_id"]: {
+            "project_id": row.get("project_id"),
+            "conversation_origin": row.get("conversation_origin"),
+        }
+        for row in (rows or [])
+        if row.get("thread_id") in conversation_ids
+    }
     return presence_probe(
         profile,
         conversation_ids,
         platform,
         skip_ids=inaccessible_ids,
+        route_hints=route_hints,
     )
 
 
@@ -492,6 +503,7 @@ def _cleanup_candidates(
         platform,
         failures,
         presence_probe,
+        rows=rows,
     )
     candidates = _candidates_from_sources(rows, failures, presence)
     if announce and failures:
@@ -552,6 +564,7 @@ def _cleanup_assessments_batch(
                 platform,
                 failures_by_profile.get(profile.id, {}),
                 presence_probe,
+                rows=rows,
             )
             if live_ids
             else None
@@ -745,14 +758,18 @@ def _maybe_refresh_desktop_assessments(
     if offer is None:
         return list(assessments)
     account_id, _host_id, uncertain_count = offer
-    answer = input(
-        f"\n{profile.display_name}: {uncertain_count} local chat(s) are still uncertain. "
-        "ChatGPT Desktop can do a fresh server reconciliation itself. "
-        "This can take several minutes and requires closing and reopening ChatGPT once. "
-        "Press Y to run it, or Enter to continue without it: "
-    ).strip().lower()
-    if answer not in {"y", "yes"}:
-        return list(assessments)
+    while True:
+        answer = input(
+            f"\n{profile.display_name}: {uncertain_count} local chat(s) are still uncertain. "
+            "ChatGPT Desktop can do a fresh server reconciliation itself. "
+            "This can take several minutes and requires closing and reopening ChatGPT once. "
+            "Press Enter or R to run the recommended refresh, or S to skip it: "
+        ).strip().lower()
+        if answer in {"", "r", "run", "y", "yes"}:
+            break
+        if answer in {"s", "skip", "n", "no"}:
+            return list(assessments)
+        print("Press Enter/R to refresh, or S to skip.")
 
     if not _wait_for_desktop_to_close(platform, purpose="refresh"):
         return list(assessments)

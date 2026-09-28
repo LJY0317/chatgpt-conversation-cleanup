@@ -515,6 +515,33 @@ class CleanupTests(unittest.TestCase):
         )
         self.assertEqual(seen["skip_ids"], {"inaccessible"})
 
+    def test_live_probe_receives_catalog_routing_hints(self):
+        self.mutate(
+            "UPDATE local_thread_catalog SET project_id=?, conversation_origin=? "
+            "WHERE thread_id='server-chat'",
+            ("g-p-project", "tpp"),
+        )
+        seen = {}
+
+        def presence(profile, ids, platform, **kwargs):
+            seen.update(kwargs)
+            return {thread_id: Presence.UNVERIFIED for thread_id in ids}
+
+        _cleanup_candidates(
+            self.profile,
+            self.platform,
+            evidence_reader=lambda *args: {},
+            presence_probe=presence,
+            announce=False,
+        )
+        self.assertEqual(
+            seen["route_hints"]["server-chat"],
+            {
+                "project_id": "g-p-project",
+                "conversation_origin": "tpp",
+            },
+        )
+
     def test_retire_installed_copy_preserves_recovery_and_is_symlink_safe(self):
         platform = MacOSAdapter(home=self.home)
         recovery = platform.recovery_root

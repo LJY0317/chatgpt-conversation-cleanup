@@ -288,42 +288,74 @@ class _CdpClient:
         return False
 
 
-def _probe_expression(conversation_ids: list[str]) -> str:
-    encoded_ids = json.dumps(conversation_ids, separators=(",", ":"))
-    # Discover the current request module by the stable /conversations/batch
-    # capability used by ChatGPT Desktop itself. Desktop also groups IDs in
-    # batches of 10. We keep the same batch size but run sequentially and pace
-    # requests to avoid the burst that the old one-ID-per-request probe caused.
-    # Asset hashes and minified symbol names are never part of the Python
-    # contract.
-    return f"""(async()=>{{try{{
+def _probe_expression(
+    conversation_ids: list[str],
+    route_hints: dict[str, dict] | None = None,
+) -> str:
+    hints = route_hints or {}
+    targets = []
+    for conversation_id in conversation_ids:
+        hint = hints.get(conversation_id) or {}
+        project_id = hint.get("project_id")
+        conversation_origin = hint.get("conversation_origin")
+        targets.append(
+            {
+                "id": conversation_id,
+                "projectId": (
+                    project_id
+                    if isinstance(project_id, str) and project_id
+                    else None
+                ),
+                "conversationOrigin": (
+                    conversation_origin
+                    if isinstance(conversation_origin, str) and conversation_origin
+                    else None
+                ),
+            }
+        )
+    encoded_targets = json.dumps(targets, separators=(",", ":"))
+    # Discover the current request module by stable ChatGPT request capabilities,
+    # never by asset hashes or minified symbol names. Ordinary global chats can
+    # use /conversations/batch. Project chats and Work chats (conversation_origin
+    # == "tpp") need their own inventory routes; mixing those IDs into the batch
+    # route can make an otherwise valid whole probe fail closed.
+    template = r"""(async()=>{try{
 const entry=[...document.scripts].map(s=>s.src).find(Boolean);
-if(!entry)return JSON.stringify({{ok:false,reason:'no_entry'}});
+if(!entry)return JSON.stringify({ok:false,reason:'no_entry'});
 const text=await fetch(entry).then(r=>r.text());
-const specs=[...new Set([...text.matchAll(/[\"'](\\.\\/[^\"']+\\.js)[\"']/g)].map(m=>m[1]))].slice(0,32);
+const specs=[...new Set([...text.matchAll(/[\"'](\.\/[^\"']+\.js)[\"']/g)].map(m=>m[1]))].slice(0,32);
 const sources=[];
-for(const spec of specs){{try{{const url=new URL(spec,entry).href;const source=await fetch(url).then(r=>r.text());sources.push([url,source]);}}catch{{}}}}
+for(const spec of specs){try{const url=new URL(spec,entry).href;const source=await fetch(url).then(r=>r.text());sources.push([url,source]);}catch{}}
 const uses=[];
-for(const [url,source] of sources){{for(const match of source.matchAll(/([A-Za-z_$][A-Za-z0-9_$]*)\\.safePost\\(\\s*[`\"']\\/conversations\\/batch[`\"']/g))uses.push([url,source,match[1]]);}}
+for(const [url,source] of sources){for(const match of source.matchAll(/([A-Za-z_$][A-Za-z0-9_$]*)\.safePost\(\s*[`\"']\/conversations\/batch[`\"']/g))uses.push([url,source,match[1]]);}
 const aliases=[...new Set(uses.map(item=>item[2]))];
-if(aliases.length!==1)return JSON.stringify({{ok:false,reason:'conversation_request_alias_unavailable'}});
+if(aliases.length!==1)return JSON.stringify({ok:false,reason:'conversation_request_alias_unavailable'});
 const alias=aliases[0],mappings=[];
-for(const [url,source] of uses){{for(const match of source.matchAll(/import\\s*\\{{([^}}]*)\\}}\\s*from\\s*[`\"'](\\.\\/[^`\"']+\\.js)[`\"']/g)){{for(const raw of match[1].split(',')){{const binding=raw.trim().match(/^([A-Za-z_$][A-Za-z0-9_$]*)(?:\\s+as\\s+([A-Za-z_$][A-Za-z0-9_$]*))?$/);if(!binding)continue;const exported=binding[1],local=binding[2]||binding[1];if(local===alias)mappings.push([new URL(match[2],url).href,exported]);}}}}}}
+for(const [url,source] of uses){for(const match of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*[`\"'](\.\/[^`\"']+\.js)[`\"']/g)){for(const raw of match[1].split(',')){const binding=raw.trim().match(/^([A-Za-z_$][A-Za-z0-9_$]*)(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?$/);if(!binding)continue;const exported=binding[1],local=binding[2]||binding[1];if(local===alias)mappings.push([new URL(match[2],url).href,exported]);}}}
 const uniqueMappings=[...new Map(mappings.map(item=>[item.join('::'),item])).values()];
-if(uniqueMappings.length!==1)return JSON.stringify({{ok:false,reason:'conversation_request_export_unavailable'}});
+if(uniqueMappings.length!==1)return JSON.stringify({ok:false,reason:'conversation_request_export_unavailable'});
 const [moduleUrl,exportName]=uniqueMappings[0],mod=await import(moduleUrl),api=mod[exportName];
-if(!(api&&typeof api==='object'&&typeof api.safePost==='function'&&typeof api.getRequestTarget==='function'))return JSON.stringify({{ok:false,reason:'conversation_request_capability_unavailable'}});
-const ids={encoded_ids};
-async function checkChunk(chunk){{const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);try{{const out=await api.safePost('/conversations/batch',{{requestBody:{{conversation_ids:chunk}},signal:controller.signal}});if(!Array.isArray(out))return{{ok:false,rateLimited:false}};const returned=out.filter(item=>item&&typeof item.id==='string').map(item=>item.id),unique=new Set(returned);if(unique.size!==returned.length||returned.some(id=>!chunk.includes(id)))return{{ok:false,rateLimited:false}};return{{ok:true,present:[...unique]}};}}catch(error){{const status=Number(error?.status??error?.responseStatus??0);return{{ok:false,rateLimited:status===429}};}}finally{{clearTimeout(timer);}}}}
-async function checkMany(targetIds){{const present=new Set;for(let index=0;index<targetIds.length;index+=10){{const chunk=targetIds.slice(index,index+10),checked=await checkChunk(chunk);if(!checked.ok)return checked;for(const id of checked.present)present.add(id);if(index+10<targetIds.length)await new Promise(resolve=>setTimeout(resolve,750));}}return{{ok:true,present:[...present]}};}}
-const first=await checkMany(ids);if(!first.ok)return JSON.stringify({{ok:false,rateLimited:first.rateLimited===true,reason:'detail_check_failed'}});
-const firstPresent=new Set(first.present),missingOnce=ids.filter(id=>!firstPresent.has(id));
-if(missingOnce.length===0)return JSON.stringify({{ok:true,rateLimited:false,results:ids.map(id=>[id,'present'])}});
-await new Promise(resolve=>setTimeout(resolve,1250));
-const second=await checkMany(missingOnce);if(!second.ok)return JSON.stringify({{ok:false,rateLimited:second.rateLimited===true,reason:'detail_recheck_failed'}});
-const secondPresent=new Set(second.present),results=ids.map(id=>[id,firstPresent.has(id)?'present':secondPresent.has(id)?'unverified':'missing']);
-return JSON.stringify({{ok:true,rateLimited:false,results}});
-}}catch{{return JSON.stringify({{ok:false,reason:'probe_failed'}});}}}})()"""
+if(!(api&&typeof api==='object'&&typeof api.safePost==='function'&&typeof api.safeGet==='function'&&typeof api.getRequestTarget==='function'))return JSON.stringify({ok:false,reason:'conversation_request_capability_unavailable'});
+const targets=__TARGETS__;
+const ids=targets.map(item=>item.id),states=new Map;
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const statusOf=error=>Number(error?.status??error?.responseStatus??0);
+function markAll(targetIds,state){for(const id of targetIds)states.set(id,state);}
+async function checkChunk(chunk){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);try{const out=await api.safePost('/conversations/batch',{requestBody:{conversation_ids:chunk},signal:controller.signal});if(!Array.isArray(out))return{ok:false,rateLimited:false};const returned=out.filter(item=>item&&typeof item.id==='string').map(item=>item.id),unique=new Set(returned);if(unique.size!==returned.length||returned.some(id=>!chunk.includes(id)))return{ok:false,rateLimited:false};return{ok:true,present:[...unique]};}catch(error){return{ok:false,rateLimited:statusOf(error)===429};}finally{clearTimeout(timer);}}
+async function checkMany(targetIds){const present=new Set;for(let index=0;index<targetIds.length;index+=10){const chunk=targetIds.slice(index,index+10),checked=await checkChunk(chunk);if(!checked.ok)return checked;for(const id of checked.present)present.add(id);if(index+10<targetIds.length)await pause(750);}return{ok:true,present:[...present]};}
+async function getOriginPage(origin,offset){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);try{const out=await api.safeGet('/conversations',{parameters:{query:{conversation_origin:origin,limit:50,offset,order:'updated',is_archived:false,hide_snorlax:false}},signal:controller.signal});return{ok:true,out};}catch(error){return{ok:false,rateLimited:statusOf(error)===429};}finally{clearTimeout(timer);}}
+async function listOrigin(origin){let offset=0;const found=new Set,seenOffsets=new Set;for(let page=0;page<200;page+=1){if(seenOffsets.has(offset))return{ok:false,rateLimited:false};seenOffsets.add(offset);const request=await getOriginPage(origin,offset);if(!request.ok)return request;const out=request.out;if(!(out&&Array.isArray(out.items)&&Number.isInteger(out.total)&&out.total>=0&&Number.isInteger(out.offset)&&out.offset===offset&&Number.isInteger(out.limit)&&out.limit>=1&&out.limit<=50))return{ok:false,rateLimited:false};for(const item of out.items){if(!(item&&typeof item.id==='string')||found.has(item.id))return{ok:false,rateLimited:false};found.add(item.id);}const next=out.offset+out.limit;if(next>=out.total)return{ok:true,present:[...found]};if(next<=offset)return{ok:false,rateLimited:false};offset=next;await pause(350);}return{ok:false,rateLimited:false};}
+async function getProjectPage(projectId,cursor){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);try{const out=await api.safeGet('/gizmos/{gizmo_id}/conversations',{parameters:{path:{gizmo_id:projectId},query:{cursor,limit:50,owned_only:false}},signal:controller.signal});return{ok:true,out};}catch(error){return{ok:false,rateLimited:statusOf(error)===429};}finally{clearTimeout(timer);}}
+async function listProject(projectId){let cursor=null;const found=new Set,seenCursors=new Set;for(let page=0;page<200;page+=1){const request=await getProjectPage(projectId,cursor);if(!request.ok)return request;const out=request.out;if(!(out&&Array.isArray(out.items)))return{ok:false,rateLimited:false};for(const item of out.items){if(!(item&&typeof item.id==='string')||found.has(item.id))return{ok:false,rateLimited:false};found.add(item.id);}const next=out.cursor??null;if(next===null)return{ok:true,present:[...found]};if(typeof next!=='string'||next.length===0||seenCursors.has(next))return{ok:false,rateLimited:false};seenCursors.add(next);cursor=next;await pause(350);}return{ok:false,rateLimited:false};}
+async function classifyInventory(targetIds,loader){const first=await loader();if(!first.ok)return first;const firstPresent=new Set(first.present);for(const id of targetIds)if(firstPresent.has(id))states.set(id,'present');const missingOnce=targetIds.filter(id=>!firstPresent.has(id));if(missingOnce.length===0)return{ok:true};await pause(1250);const second=await loader();if(!second.ok){markAll(missingOnce,'unverified');return second;}const secondPresent=new Set(second.present);for(const id of missingOnce)states.set(id,secondPresent.has(id)?'unverified':'missing');return{ok:true};}
+const plain=[],tpp=[],projects=new Map;
+for(const target of targets){if(target.conversationOrigin==='tpp'){tpp.push(target.id);continue;}if(target.projectId!=null){const group=projects.get(target.projectId)??[];group.push(target.id);projects.set(target.projectId,group);continue;}if(target.conversationOrigin==null){plain.push(target.id);continue;}states.set(target.id,'unverified');}
+if(plain.length>0){const first=await checkMany(plain);if(!first.ok){if(first.rateLimited)return JSON.stringify({ok:false,rateLimited:true,reason:'detail_check_rate_limited'});markAll(plain,'unverified');}else{const firstPresent=new Set(first.present),missingOnce=plain.filter(id=>!firstPresent.has(id));for(const id of plain)if(firstPresent.has(id))states.set(id,'present');if(missingOnce.length>0){await pause(1250);const second=await checkMany(missingOnce);if(!second.ok){if(second.rateLimited)return JSON.stringify({ok:false,rateLimited:true,reason:'detail_recheck_rate_limited'});markAll(missingOnce,'unverified');}else{const secondPresent=new Set(second.present);for(const id of missingOnce)states.set(id,secondPresent.has(id)?'unverified':'missing');}}}}
+if(tpp.length>0){const checked=await classifyInventory(tpp,()=>listOrigin('tpp'));if(!checked.ok&&checked.rateLimited)return JSON.stringify({ok:false,rateLimited:true,reason:'tpp_inventory_rate_limited'});if(!checked.ok&&!tpp.some(id=>states.has(id)))markAll(tpp,'unverified');}
+for(const [projectId,projectIds] of projects){const checked=await classifyInventory(projectIds,()=>listProject(projectId));if(!checked.ok&&checked.rateLimited)return JSON.stringify({ok:false,rateLimited:true,reason:'project_inventory_rate_limited'});if(!checked.ok&&!projectIds.some(id=>states.has(id)))markAll(projectIds,'unverified');await pause(350);}
+return JSON.stringify({ok:true,rateLimited:false,results:ids.map(id=>[id,states.get(id)??'unverified'])});
+}catch{return JSON.stringify({ok:false,reason:'probe_failed'});}})()"""
+    return template.replace("__TARGETS__", encoded_targets)
 
 
 def probe_conversation_presence(
@@ -332,6 +364,7 @@ def probe_conversation_presence(
     platform: PlatformAdapter,
     *,
     skip_ids: set[str] | None = None,
+    route_hints: dict[str, dict] | None = None,
     target: CdpTarget | None = None,
     client_factory=_CdpClient,
 ) -> dict[str, Presence] | None:
@@ -351,7 +384,7 @@ def probe_conversation_presence(
     try:
         with client_factory(target) as client:
             raw = client.evaluate(
-                _probe_expression(ids)
+                _probe_expression(ids, route_hints=route_hints)
             )
         payload = json.loads(raw)
     except (DesktopProbeError, OSError, TimeoutError, ValueError, json.JSONDecodeError):
