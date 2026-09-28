@@ -334,6 +334,61 @@ class CleanupTests(unittest.TestCase):
         )
         self.assertFalse(adapter.profile_catalog_refresh_gate(profile)[0])
 
+    def test_macos_automatic_profile_launch_uses_verified_provider_route(self):
+        adapter = MacOSAdapter(home=self.home)
+        result = type(
+            "ProcessResult",
+            (),
+            {"returncode": 0, "stdout": "{}", "stderr": ""},
+        )()
+        official = Profile(
+            "default",
+            "ChatGPT",
+            self.root,
+            "official",
+        )
+        with patch(
+            "chatgpt_cleanup.platforms.subprocess.run",
+            return_value=result,
+        ) as run:
+            launched, _ = adapter.launch_profile_desktop(official)
+        self.assertTrue(launched)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/open", "-a", "/Applications/ChatGPT.app"],
+        )
+
+        plura = Profile(
+            "profile2",
+            "Profile 2",
+            self.home / ".codex-profile2",
+            "plura-desktop",
+            desktop_data_root=self.home / "Library/Application Support/Codex-Profile2",
+        )
+        with (
+            patch(
+                "chatgpt_cleanup.platforms.shutil.which",
+                return_value="/opt/homebrew/bin/plura-desktop",
+            ),
+            patch(
+                "chatgpt_cleanup.platforms.subprocess.run",
+                return_value=result,
+            ) as run,
+        ):
+            launched, _ = adapter.launch_profile_desktop(plura)
+        self.assertTrue(launched)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "/opt/homebrew/bin/plura-desktop",
+                "launch-target",
+                "--target",
+                "local.plura-desktop.profile2",
+                "--renderer-cdp",
+                "--json",
+            ],
+        )
+
     def test_macos_profile_stop_guard_ignores_other_isolated_profile(self):
         adapter = MacOSAdapter(home=self.home)
         profile = Profile(

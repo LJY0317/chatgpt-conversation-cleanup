@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import unicodedata
 
 from . import __version__
@@ -26,8 +27,10 @@ from .core import (
 from .codex_delete import execute_codex_delete_plan, preview_codex_delete
 from .desktop_probe import Presence, probe_conversation_presence
 from .desktop_refresh import (
+    desktop_catalog_refresh_progress,
     desktop_catalog_refresh_result,
     prepare_desktop_catalog_refresh,
+    recent_full_reconciliation_age_seconds,
 )
 from .evidence import (
     SAFE_CLEANUP_ERROR_CODES,
@@ -747,25 +750,104 @@ def _apply_desktop_refresh_result(profile, assessments, result):
     return updated, before_ids - after_ids, result.missing_ids & after_ids
 
 
-def _maybe_refresh_desktop_assessments(
+def _refresh_progress_text(profile, progress):
+    stage = {
+        "waiting": "waiting for Desktop to start",
+        "incremental": "incremental sync",
+        "between-scans": "waiting for the full pass",
+        "full": "full reconciliation",
+        "complete": "full reconciliation complete",
+    }.get(progress.stage, progress.stage)
+    details = []
+    if progress.phase:
+        details.append(f"phase {display(progress.phase)}")
+    if progress.seen_entries:
+        details.append(f"{progress.seen_entries} seen")
+    details.append(f"{progress.catalog_rows} local")
+    if progress.missing_candidates:
+        details.append(f"{progress.missing_candidates} missing candidate(s)")
+    suffix = " · " + " · ".join(details) if details else ""
+    return f"{profile.display_name}: {stage}{suffix}"
+
+
+def _wait_for_desktop_refresh(
+    profile,
+    request,
+    platform,
+    *,
+    refresh_result=desktop_catalog_refresh_result,
+    progress_reader=desktop_catalog_refresh_progress,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    poll_seconds=2.0,
+    idle_timeout_seconds=300.0,
+    total_timeout_seconds=900.0,
+):
+    started = monotonic()
+    last_change = started
+    last_signature = None
+    while True:
+        result = refresh_result(profile, request, platform)
+        if result is not None:
+            return result
+
+        progress = progress_reader(profile, request)
+        signature = (
+            progress.stage,
+            progress.observation_sequence,
+            progress.mode,
+            progress.phase,
+            progress.seen_entries,
+            progress.catalog_rows,
+            progress.missing_candidates,
+        )
+        now = monotonic()
+        if signature != last_signature:
+            print("  " + _refresh_progress_text(profile, progress))
+            last_signature = signature
+            last_change = now
+
+        if now - started >= total_timeout_seconds:
+            print(
+                f"{profile.display_name}: still not finished after "
+                f"{int(total_timeout_seconds // 60)} minutes. Continuing without "
+                "waiting; Desktop can finish the queued reconciliation on its own."
+            )
+            return None
+        if now - last_change >= idle_timeout_seconds:
+            print(
+                f"{profile.display_name}: reconciliation has not made visible progress "
+                f"for {int(idle_timeout_seconds // 60)} minutes. Continuing without "
+                "waiting; no conversation row is changed by the waiting step."
+            )
+            return None
+        sleep(poll_seconds)
+
+
+def _queue_desktop_refresh(
     profile,
     assessments,
     platform,
     *,
     refresh_prepare=prepare_desktop_catalog_refresh,
-    refresh_result=desktop_catalog_refresh_result,
 ):
-    """Offer a Desktop-owned fresh reconciliation for still-uncertain rows.
-
-    This is deliberately interactive and build/provider gated. The normal
-    single-profile app is the default, while independently verified isolated
-    runtimes such as Plura profiles can use the same Desktop-owned repair path.
-    """
-
     offer = _desktop_refresh_offer(profile, assessments, platform)
     if offer is None:
-        return list(assessments)
-    account_id, _host_id, candidate_count = offer
+        return None
+    account_id, host_id, candidate_count = offer
+    recent_age = recent_full_reconciliation_age_seconds(profile, host_id)
+    if recent_age is not None and recent_age < 600:
+        age_text = (
+            "less than a minute"
+            if recent_age < 60
+            else f"{max(1, round(recent_age / 60))} minute(s)"
+        )
+        print(
+            f"\n{profile.display_name}: a full reconciliation finished "
+            f"{age_text} ago, so it will be reused "
+            "instead of running another full scan now."
+        )
+        return None
     while True:
         answer = input(
             f"\n{profile.display_name}: {candidate_count} local chat(s) look stale or still need reconciliation. "
@@ -776,35 +858,58 @@ def _maybe_refresh_desktop_assessments(
         if answer in {"", "r", "run", "y", "yes"}:
             break
         if answer in {"s", "skip", "n", "no"}:
-            return list(assessments)
+            return None
         print("Press Enter/R to refresh, or S to skip.")
 
     if not _wait_for_desktop_to_close(platform, purpose="refresh", profile=profile):
-        return list(assessments)
+        return None
 
     request = refresh_prepare(profile, account_id, platform)
-    print(
-        f"\nFresh reconciliation queued. Open {profile.display_name} now and leave it open. "
-        "Desktop may finish an incremental pass before the full pass, so this can "
-        "take several minutes."
-    )
-    while True:
-        answer = input(
-            "Press Enter to check whether Desktop finished, or S to stop waiting: "
-        ).strip().lower()
-        if answer in {"s", "stop", "c", "cancel"}:
-            print(
-                "Stopped waiting. No conversation row was changed by this utility. "
-                "The queued Desktop refresh can continue the next time ChatGPT runs."
-            )
-            return list(assessments)
-        result = refresh_result(profile, request, platform)
-        if result is not None:
-            break
+    launcher = getattr(platform, "launch_profile_desktop", None)
+    launched = False
+    launch_reason = "automatic launch is unavailable"
+    if launcher is not None:
+        launched, launch_reason = launcher(profile)
+    if launched:
         print(
-            "Desktop has not completed the fresh full reconciliation yet. "
-            "Leave ChatGPT open for a while longer, then check again."
+            f"\nFresh reconciliation queued and {profile.display_name} was opened. "
+            "Waiting automatically; Desktop may finish an incremental pass before "
+            "the full pass. Press Ctrl+C to stop waiting."
         )
+    else:
+        print(
+            f"\nFresh reconciliation queued. Open {profile.display_name} and leave it "
+            f"open. Automatic launch was unavailable ({display(launch_reason)}). "
+            "Waiting automatically; press Ctrl+C to stop waiting."
+        )
+    return request
+
+
+def _finish_desktop_refresh(
+    profile,
+    assessments,
+    request,
+    platform,
+    *,
+    refresh_result=desktop_catalog_refresh_result,
+    progress_reader=desktop_catalog_refresh_progress,
+):
+    try:
+        result = _wait_for_desktop_refresh(
+            profile,
+            request,
+            platform,
+            refresh_result=refresh_result,
+            progress_reader=progress_reader,
+        )
+    except KeyboardInterrupt:
+        print(
+            "\nStopped waiting. Desktop can continue the queued reconciliation; "
+            "the cleanup will use the earlier evidence for now."
+        )
+        return list(assessments)
+    if result is None:
+        return list(assessments)
 
     updated, removed, newly_missing = _apply_desktop_refresh_result(
         profile, assessments, result
@@ -821,6 +926,35 @@ def _maybe_refresh_desktop_assessments(
             "absent from Desktop's current active history and can be preselected."
         )
     return updated
+
+
+def _maybe_refresh_desktop_assessments(
+    profile,
+    assessments,
+    platform,
+    *,
+    refresh_prepare=prepare_desktop_catalog_refresh,
+    refresh_result=desktop_catalog_refresh_result,
+    progress_reader=desktop_catalog_refresh_progress,
+):
+    """Queue, launch, monitor and apply one Desktop-owned reconciliation."""
+
+    request = _queue_desktop_refresh(
+        profile,
+        assessments,
+        platform,
+        refresh_prepare=refresh_prepare,
+    )
+    if request is None:
+        return list(assessments)
+    return _finish_desktop_refresh(
+        profile,
+        assessments,
+        request,
+        platform,
+        refresh_result=refresh_result,
+        progress_reader=progress_reader,
+    )
 
 
 def _collect_work(
@@ -843,6 +977,27 @@ def _collect_work(
         if action == "catalog"
         else None
     )
+    if action == "catalog":
+        refresh_requests = {}
+        # Queue and launch every eligible profile before waiting for any one of
+        # them. Independent profile catalogs can then reconcile in parallel,
+        # reducing total wall-clock time when multiple profiles are selected.
+        for profile in profiles:
+            assessments = catalog_assessments.get(profile.id, [])
+            request = _queue_desktop_refresh(profile, assessments, platform)
+            if request is not None:
+                refresh_requests[profile.id] = request
+        for profile in profiles:
+            request = refresh_requests.get(profile.id)
+            if request is None:
+                continue
+            catalog_assessments[profile.id] = _finish_desktop_refresh(
+                profile,
+                catalog_assessments.get(profile.id, []),
+                request,
+                platform,
+            )
+
     for profile in profiles:
         print(f"\n— {profile.display_name} —\n")
         if action == "delete":
@@ -850,9 +1005,6 @@ def _collect_work(
             selected = choose(rows, kind="archived", default_all=True)
         else:
             assessments = catalog_assessments.get(profile.id, [])
-            assessments = _maybe_refresh_desktop_assessments(
-                profile, assessments, platform
-            )
             selected = choose_cleanup_assessments(assessments)
         work.append((profile, selected))
     return work

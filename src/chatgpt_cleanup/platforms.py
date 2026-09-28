@@ -65,6 +65,9 @@ class PlatformAdapter:
     def profile_catalog_refresh_gate(self, profile: "Profile") -> tuple[bool, str]:
         return self.catalog_refresh_gate()
 
+    def launch_profile_desktop(self, profile: "Profile") -> tuple[bool, str]:
+        return False, f"Automatic profile launch is not supported on {self.display_name}."
+
 
 @dataclass(frozen=True)
 class MacOSAdapter(PlatformAdapter):
@@ -264,6 +267,51 @@ class MacOSAdapter(PlatformAdapter):
             return False, "The Plura ChatGPT runtime build could not be read."
         return False, f"Plura ChatGPT build {short} ({build}) is not refresh-verified."
 
+    def launch_profile_desktop(self, profile: "Profile") -> tuple[bool, str]:
+        try:
+            if profile.provider == "official":
+                result = subprocess.run(
+                    ["/usr/bin/open", "-a", str(self.app_path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
+                if result.returncode == 0:
+                    return True, "opened ChatGPT"
+                return False, result.stderr.strip() or "ChatGPT could not be opened."
+
+            if profile.provider == "plura-desktop":
+                suffix = profile.id.removeprefix("profile")
+                if not suffix.isdigit():
+                    return False, "Could not identify the Plura profile runtime."
+                command = shutil.which("plura-desktop")
+                if not command:
+                    return False, "plura-desktop is unavailable."
+                target = f"local.plura-desktop.profile{int(suffix)}"
+                result = subprocess.run(
+                    [
+                        command,
+                        "launch-target",
+                        "--target",
+                        target,
+                        "--renderer-cdp",
+                        "--json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+                if result.returncode == 0:
+                    return True, f"opened {profile.display_name}"
+                return False, result.stderr.strip() or result.stdout.strip() or (
+                    f"{profile.display_name} could not be opened."
+                )
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, str(error)
+        return False, f"Automatic launch is not verified for {profile.provider}."
+
 
 @dataclass(frozen=True)
 class WindowsAdapter(PlatformAdapter):
@@ -314,6 +362,9 @@ class WindowsAdapter(PlatformAdapter):
 
     def profile_catalog_refresh_gate(self, profile: "Profile") -> tuple[bool, str]:
         return self.catalog_refresh_gate()
+
+    def launch_profile_desktop(self, profile: "Profile") -> tuple[bool, str]:
+        return False, "Automatic Desktop launch is not yet verified on Windows."
 
 
 def current_platform(*, home: Path | None = None) -> PlatformAdapter:

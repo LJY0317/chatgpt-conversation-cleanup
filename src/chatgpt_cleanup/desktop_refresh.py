@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import time
 
 from .core import database, require, require_catalog_write, write_schema
@@ -24,6 +25,114 @@ class DesktopCatalogRefreshResult:
     observation_sequence: int
     present_ids: frozenset[str]
     missing_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
+class DesktopCatalogRefreshProgress:
+    stage: str
+    observation_sequence: int | None
+    completed_at_ms: int | None
+    mode: str | None
+    phase: str | None
+    seen_entries: int
+    catalog_rows: int
+    missing_candidates: int
+
+
+def recent_full_reconciliation_age_seconds(
+    profile: Profile,
+    host_id: str,
+    *,
+    now_ms: int | None = None,
+) -> float | None:
+    path = profile.root / "sqlite/codex-dev.db"
+    with database(path, profile.root) as db:
+        write_schema(db)
+        row = db.execute(
+            "SELECT last_full_reconciled_at FROM local_thread_catalog_sync_state "
+            "WHERE host_id=?",
+            (host_id,),
+        ).fetchone()
+    if row is None or not isinstance(row["last_full_reconciled_at"], int):
+        return None
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    age_ms = current_ms - row["last_full_reconciled_at"]
+    if age_ms < 0:
+        return 0.0
+    return age_ms / 1000.0
+
+
+def desktop_catalog_refresh_progress(
+    profile: Profile,
+    request: DesktopCatalogRefreshRequest,
+) -> DesktopCatalogRefreshProgress:
+    path = profile.root / "sqlite/codex-dev.db"
+    with database(path, profile.root) as db:
+        write_schema(db)
+        state = db.execute(
+            "SELECT observation_sequence,last_full_reconciled_at "
+            "FROM local_thread_catalog_sync_state WHERE host_id=?",
+            (request.host_id,),
+        ).fetchone()
+        checkpoint = db.execute(
+            "SELECT checkpoint FROM local_thread_catalog_scan_checkpoints "
+            "WHERE host_id=?",
+            (request.host_id,),
+        ).fetchone()
+        seen_entries = db.execute(
+            "SELECT count(*) FROM local_thread_catalog_scan_entries WHERE host_id=?",
+            (request.host_id,),
+        ).fetchone()[0]
+        counts = db.execute(
+            "SELECT count(*) AS catalog_rows, "
+            "sum(CASE WHEN missing_candidate=1 THEN 1 ELSE 0 END) AS missing_candidates "
+            "FROM local_thread_catalog WHERE host_id=? AND source_kind='chatgpt'",
+            (request.host_id,),
+        ).fetchone()
+
+    sequence = state["observation_sequence"] if state is not None else None
+    completed_at = state["last_full_reconciled_at"] if state is not None else None
+    mode = None
+    phase = None
+    if checkpoint is not None:
+        try:
+            payload = json.loads(checkpoint["checkpoint"])
+            attempt = payload.get("attempt") or {}
+            progress = payload.get("progress") or {}
+            if isinstance(attempt.get("mode"), str):
+                mode = attempt["mode"]
+            if isinstance(progress.get("phase"), str):
+                phase = progress["phase"]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    if (
+        isinstance(sequence, int)
+        and sequence > request.starting_observation_sequence
+        and isinstance(completed_at, int)
+        and completed_at >= request.requested_at_ms
+        and completed_at != request.previous_last_full_reconciled_at
+    ):
+        stage = "complete"
+    elif mode == "full":
+        stage = "full"
+    elif mode == "incremental":
+        stage = "incremental"
+    elif isinstance(sequence, int) and sequence > request.starting_observation_sequence:
+        stage = "between-scans"
+    else:
+        stage = "waiting"
+
+    return DesktopCatalogRefreshProgress(
+        stage=stage,
+        observation_sequence=sequence if isinstance(sequence, int) else None,
+        completed_at_ms=completed_at if isinstance(completed_at, int) else None,
+        mode=mode,
+        phase=phase,
+        seen_entries=int(seen_entries),
+        catalog_rows=int(counts["catalog_rows"] or 0),
+        missing_candidates=int(counts["missing_candidates"] or 0),
+    )
 
 
 def require_desktop_catalog_refresh(profile: Profile, platform: PlatformAdapter) -> None:

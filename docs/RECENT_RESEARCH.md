@@ -28,6 +28,8 @@ A later real-session validation exposed a second source of false uncertainty: `/
 
 The same Desktop-owned full reconciliation was then exercised end-to-end on the isolated Plura Profile 2 runtime using its own `~/.codex-profile2` catalog and `Codex-Profile2` user-data directory. Desktop reduced the local ChatGPT catalog from 34 rows to 14 without direct row deletion by the cleanup utility; a subsequent category-aware current-session check reported all 14 remaining rows present. This validates the Plura provider/build combination for the same repair-first flow, while keeping the gate tied to the verified runtime manifest and ChatGPT build.
 
+The UX was subsequently changed so that this slower first-party repair path no longer requires repeated manual polling. Verified profiles are reopened automatically, checkpoint state is monitored for incremental/full progress, and multiple selected isolated profiles are queued before waiting so their scans can overlap. A 10-minute freshness window prevents an immediately repeated full-history scan after one has just completed; direct evidence/manual review remains available during that window instead of paying the full cost again.
+
 ## Archived Codex deletion
 
 Recent repositories inspected:

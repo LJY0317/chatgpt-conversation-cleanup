@@ -11,12 +11,16 @@ from chatgpt_cleanup.core import SafetyError
 from chatgpt_cleanup.__main__ import (
     _desktop_refresh_offer,
     _maybe_refresh_desktop_assessments,
+    _wait_for_desktop_refresh,
 )
 from chatgpt_cleanup.desktop_refresh import (
+    DesktopCatalogRefreshProgress,
     DesktopCatalogRefreshRequest,
     DesktopCatalogRefreshResult,
+    desktop_catalog_refresh_progress,
     desktop_catalog_refresh_result,
     prepare_desktop_catalog_refresh,
+    recent_full_reconciliation_age_seconds,
 )
 from chatgpt_cleanup.platforms import PlatformError
 from chatgpt_cleanup.profiles import Profile, ProfileIdentity
@@ -449,6 +453,106 @@ class DesktopRefreshTests(unittest.TestCase):
         self.assertIsNone(
             desktop_catalog_refresh_result(self.profile, request, self.platform)
         )
+
+    def test_progress_reports_waiting_full_and_complete_stages(self):
+        request = DesktopCatalogRefreshRequest(
+            profile_id="default",
+            host_id=self.host,
+            requested_at_ms=1000,
+            starting_observation_sequence=20,
+            previous_last_full_reconciled_at=900,
+        )
+        progress = desktop_catalog_refresh_progress(self.profile, request)
+        self.assertEqual(progress.stage, "waiting")
+        self.assertEqual(progress.catalog_rows, 0)
+
+        db = sqlite3.connect(self.db_path)
+        try:
+            db.execute(
+                "UPDATE local_thread_catalog_sync_state SET observation_sequence=21,"
+                "last_full_reconciled_at=NULL WHERE host_id=?",
+                (self.host,),
+            )
+            db.execute(
+                "INSERT INTO local_thread_catalog_scan_checkpoints VALUES(?,?,NULL)",
+                (
+                    self.host,
+                    '{"attempt":{"mode":"full"},"progress":{"phase":"head"}}',
+                ),
+            )
+            db.commit()
+        finally:
+            db.close()
+        progress = desktop_catalog_refresh_progress(self.profile, request)
+        self.assertEqual(progress.stage, "full")
+        self.assertEqual(progress.phase, "head")
+
+        db = sqlite3.connect(self.db_path)
+        try:
+            db.execute(
+                "UPDATE local_thread_catalog_sync_state SET observation_sequence=22,"
+                "last_full_reconciled_at=1100 WHERE host_id=?",
+                (self.host,),
+            )
+            db.commit()
+        finally:
+            db.close()
+        progress = desktop_catalog_refresh_progress(self.profile, request)
+        self.assertEqual(progress.stage, "complete")
+
+    def test_recent_full_reconciliation_age_is_read_without_mutation(self):
+        self.assertEqual(
+            recent_full_reconciliation_age_seconds(
+                self.profile,
+                self.host,
+                now_ms=10_900,
+            ),
+            10.0,
+        )
+
+    def test_automatic_wait_returns_result_without_manual_check_prompt(self):
+        request = DesktopCatalogRefreshRequest(
+            profile_id="default",
+            host_id=self.host,
+            requested_at_ms=1000,
+            starting_observation_sequence=20,
+            previous_last_full_reconciled_at=900,
+        )
+        expected = DesktopCatalogRefreshResult(
+            host_id=self.host,
+            completed_at_ms=1100,
+            observation_sequence=22,
+            present_ids=frozenset({"present"}),
+            missing_ids=frozenset(),
+        )
+        results = iter([None, None, expected])
+        progress = DesktopCatalogRefreshProgress(
+            stage="full",
+            observation_sequence=21,
+            completed_at_ms=None,
+            mode="full",
+            phase="head",
+            seen_entries=3,
+            catalog_rows=4,
+            missing_candidates=0,
+        )
+        clock = iter([0.0, 1.0, 2.0, 3.0])
+        slept = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = _wait_for_desktop_refresh(
+                self.profile,
+                request,
+                self.platform,
+                refresh_result=lambda *args: next(results),
+                progress_reader=lambda *args: progress,
+                monotonic=lambda: next(clock),
+                sleep=lambda value: slept.append(value),
+                poll_seconds=0.25,
+                idle_timeout_seconds=30,
+                total_timeout_seconds=60,
+            )
+        self.assertEqual(result, expected)
+        self.assertEqual(slept, [0.25, 0.25])
 
 
 if __name__ == "__main__":
