@@ -362,6 +362,27 @@ class CleanupTests(unittest.TestCase):
         ):
             adapter.require_profile_desktop_stopped(profile)
 
+    def test_macos_profile_stop_guard_treats_envless_app_server_as_default_profile(self):
+        adapter = MacOSAdapter(home=self.home)
+        profile = Profile(
+            "profile2",
+            "Profile 2",
+            self.home / ".codex-profile2",
+            "plura-desktop",
+            desktop_data_root=self.home / "Library/Application Support/Codex-Profile2",
+        )
+        listing = type(
+            "ProcessResult",
+            (),
+            {"stdout": "321 /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex app-server\n"},
+        )()
+        detail = type("ProcessResult", (), {"stdout": "codex app-server\n"})()
+        with patch(
+            "chatgpt_cleanup.platforms.subprocess.run",
+            side_effect=[listing, detail],
+        ):
+            adapter.require_profile_desktop_stopped(profile)
+
     def test_macos_profile_stop_guard_blocks_app_server_using_same_codex_home(self):
         adapter = MacOSAdapter(home=self.home)
         profile = Profile(

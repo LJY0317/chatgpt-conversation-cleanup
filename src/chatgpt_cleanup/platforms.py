@@ -150,6 +150,11 @@ class MacOSAdapter(PlatformAdapter):
                 ]
                 if home_tokens and codex_home not in home_tokens:
                     continue
+                if not home_tokens and profile.root != self.home / ".codex":
+                    # An app-server with no explicit CODEX_HOME uses the normal
+                    # default ~/.codex. It cannot own an isolated alternate
+                    # profile rooted elsewhere (for example ~/.codex-profile2).
+                    continue
                 raise PlatformError(
                     f"Quit {profile.display_name}'s Codex app-server normally before applying changes."
                 )
