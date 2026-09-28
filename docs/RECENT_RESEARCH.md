@@ -26,6 +26,8 @@ The production design therefore mirrors that host-scoped scheduling contract whi
 
 A later real-session validation exposed a second source of false uncertainty: `/conversations/batch` is appropriate for ordinary global chats, but Work (`conversation_origin=tpp`) and Project (`g-p-*`) rows have separate inventory surfaces. Mixing those rows into one batch probe could fail closed for the entire profile. The current verifier now uses the active `tpp` history inventory for Work chats and each project's `/gizmos/{gizmo_id}/conversations` inventory for Project chats, while keeping ordinary chats on the batch route. Each omission is rechecked, category failures are isolated, and 429 still cancels all partial live evidence.
 
+The same Desktop-owned full reconciliation was then exercised end-to-end on the isolated Plura Profile 2 runtime using its own `~/.codex-profile2` catalog and `Codex-Profile2` user-data directory. Desktop reduced the local ChatGPT catalog from 34 rows to 14 without direct row deletion by the cleanup utility; a subsequent category-aware current-session check reported all 14 remaining rows present. This validates the Plura provider/build combination for the same repair-first flow, while keeping the gate tied to the verified runtime manifest and ChatGPT build.
+
 ## Archived Codex deletion
 
 Recent repositories inspected:

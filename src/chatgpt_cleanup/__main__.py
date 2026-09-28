@@ -655,30 +655,39 @@ def _cleanup_candidates_batch(
 
 
 def _desktop_refresh_offer(profile, assessments, platform):
-    if not assessments or profile.provider != "official" or profile.identity is None:
+    if not assessments or profile.identity is None:
         return None
     account_id = profile.identity.workspace_account_id
     if not account_id:
         return None
     write_gate = getattr(platform, "catalog_write_gate", None)
-    refresh_gate = getattr(platform, "catalog_refresh_gate", None)
-    if write_gate is None or refresh_gate is None:
+    refresh_gate = getattr(platform, "profile_catalog_refresh_gate", None)
+    fallback_refresh_gate = getattr(platform, "catalog_refresh_gate", None)
+    if write_gate is None or (refresh_gate is None and fallback_refresh_gate is None):
         return None
-    if not write_gate()[0] or not refresh_gate()[0]:
+    refresh_status = (
+        refresh_gate(profile) if refresh_gate is not None else fallback_refresh_gate()
+    )
+    if not write_gate()[0] or not refresh_status[0]:
         return None
     host_id = _current_workspace_host_id(
         profile, [item.row for item in assessments]
     )
     if host_id is None:
         return None
-    uncertain_count = sum(
+    candidate_count = sum(
         item.row.get("host_id") == host_id
-        and item.status in {ReconcileStatus.SUSPECTED, ReconcileStatus.UNKNOWN}
+        and item.status
+        in {
+            ReconcileStatus.CONFIRMED,
+            ReconcileStatus.SUSPECTED,
+            ReconcileStatus.UNKNOWN,
+        }
         for item in assessments
     )
-    if uncertain_count == 0:
+    if candidate_count == 0:
         return None
-    return account_id, host_id, uncertain_count
+    return account_id, host_id, candidate_count
 
 
 def _apply_desktop_refresh_result(profile, assessments, result):
@@ -748,20 +757,19 @@ def _maybe_refresh_desktop_assessments(
 ):
     """Offer a Desktop-owned fresh reconciliation for still-uncertain rows.
 
-    This is deliberately an interactive, official-provider path. The normal
-    single-profile app is the default; alternate profile runtimes keep their
-    existing evidence/manual-review path until their launch/lifecycle contract
-    is independently verified.
+    This is deliberately interactive and build/provider gated. The normal
+    single-profile app is the default, while independently verified isolated
+    runtimes such as Plura profiles can use the same Desktop-owned repair path.
     """
 
     offer = _desktop_refresh_offer(profile, assessments, platform)
     if offer is None:
         return list(assessments)
-    account_id, _host_id, uncertain_count = offer
+    account_id, _host_id, candidate_count = offer
     while True:
         answer = input(
-            f"\n{profile.display_name}: {uncertain_count} local chat(s) are still uncertain. "
-            "ChatGPT Desktop can do a fresh server reconciliation itself. "
+            f"\n{profile.display_name}: {candidate_count} local chat(s) look stale or still need reconciliation. "
+            "ChatGPT Desktop can repair its own local list with a fresh server reconciliation first. "
             "This can take several minutes and requires closing and reopening ChatGPT once. "
             "Press Enter or R to run the recommended refresh, or S to skip it: "
         ).strip().lower()
@@ -776,7 +784,7 @@ def _maybe_refresh_desktop_assessments(
 
     request = refresh_prepare(profile, account_id, platform)
     print(
-        "\nFresh reconciliation queued. Open ChatGPT now and leave it open. "
+        f"\nFresh reconciliation queued. Open {profile.display_name} now and leave it open. "
         "Desktop may finish an incremental pass before the full pass, so this can "
         "take several minutes."
     )
@@ -972,11 +980,11 @@ def doctor_data(profile, platform):
     writable, reason = platform.catalog_write_gate()
     data["catalog_write_enabled"] = writable
     data["catalog_write_gate"] = reason
-    refresh_gate = getattr(platform, "catalog_refresh_gate", None)
+    refresh_gate = getattr(platform, "profile_catalog_refresh_gate", None)
     if refresh_gate is None:
         refreshable, refresh_reason = False, "Desktop catalog refresh is unavailable."
     else:
-        refreshable, refresh_reason = refresh_gate()
+        refreshable, refresh_reason = refresh_gate(profile)
     data["catalog_refresh_enabled"] = refreshable and writable
     data["catalog_refresh_gate"] = refresh_reason
     return data

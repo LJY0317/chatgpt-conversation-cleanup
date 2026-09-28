@@ -287,6 +287,53 @@ class CleanupTests(unittest.TestCase):
             self.assertTrue(adapter.catalog_write_gate()[0])
             self.assertFalse(adapter.catalog_refresh_gate()[0])
 
+    def test_macos_plura_profile_refresh_gate_verifies_runtime_build(self):
+        root = self.home / ".codex-profile2"
+        root.mkdir()
+        metadata = self.home / "Library/Application Support/PluraDesktop"
+        metadata.mkdir(parents=True)
+        app = metadata / "runtime-apps/profile-2/ChatGPT.app"
+        executable = app / "Contents/MacOS/ChatGPT"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("fixture")
+        (app / "Contents/Info.plist").write_bytes(
+            plistlib.dumps(
+                {
+                    "CFBundleShortVersionString": "26.924.22138",
+                    "CFBundleVersion": "11645",
+                }
+            )
+        )
+        (metadata / "profile-2-install-manifest.json").write_text(
+            json.dumps(
+                {
+                    "id": "local.plura-desktop.profile2",
+                    "ready": True,
+                    "profile_index": 2,
+                    "app_executable": str(executable),
+                }
+            )
+        )
+        profile = Profile(
+            "profile2",
+            "Profile 2",
+            root,
+            "plura-desktop",
+            desktop_data_root=self.home / "Library/Application Support/Codex-Profile2",
+        )
+        adapter = MacOSAdapter(home=self.home)
+        self.assertTrue(adapter.profile_catalog_refresh_gate(profile)[0])
+
+        (app / "Contents/Info.plist").write_bytes(
+            plistlib.dumps(
+                {
+                    "CFBundleShortVersionString": "26.999.0",
+                    "CFBundleVersion": "99999",
+                }
+            )
+        )
+        self.assertFalse(adapter.profile_catalog_refresh_gate(profile)[0])
+
     def test_macos_profile_stop_guard_ignores_other_isolated_profile(self):
         adapter = MacOSAdapter(home=self.home)
         profile = Profile(

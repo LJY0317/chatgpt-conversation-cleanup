@@ -8,7 +8,10 @@ from unittest.mock import patch
 
 from chatgpt_cleanup import core
 from chatgpt_cleanup.core import SafetyError
-from chatgpt_cleanup.__main__ import _maybe_refresh_desktop_assessments
+from chatgpt_cleanup.__main__ import (
+    _desktop_refresh_offer,
+    _maybe_refresh_desktop_assessments,
+)
 from chatgpt_cleanup.desktop_refresh import (
     DesktopCatalogRefreshRequest,
     DesktopCatalogRefreshResult,
@@ -33,6 +36,9 @@ class RefreshPlatform:
 
     def catalog_refresh_gate(self):
         return True, "test refresh gate"
+
+    def profile_catalog_refresh_gate(self, profile):
+        return True, "test profile refresh gate"
 
     def require_desktop_stopped(self):
         if self.running:
@@ -400,6 +406,26 @@ class DesktopRefreshTests(unittest.TestCase):
         self.assertEqual(by_id["present"], ReconcileStatus.PRESENT)
         self.assertEqual(by_id["missing"], ReconcileStatus.CONFIRMED)
         self.assertEqual(by_id["protected"], ReconcileStatus.PROTECTED)
+
+    def test_plura_confirmed_leftovers_are_offered_desktop_owned_refresh_first(self):
+        self.add_row("confirmed", missing=0, sequence=1)
+        profile = Profile(
+            "profile2",
+            "Profile 2",
+            self.root,
+            "plura-desktop",
+            identity=ProfileIdentity(workspace_account_id="account-one"),
+        )
+        row = core.chatgpt_catalog(profile)[0]
+        assessments = [
+            CatalogAssessment(
+                row=row,
+                status=ReconcileStatus.CONFIRMED,
+                reason="fixture",
+            )
+        ]
+        offer = _desktop_refresh_offer(profile, assessments, self.platform)
+        self.assertEqual(offer, ("account-one", self.host, 1))
 
     def test_result_rejects_old_full_timestamp_even_if_sequence_advanced(self):
         request = DesktopCatalogRefreshRequest(

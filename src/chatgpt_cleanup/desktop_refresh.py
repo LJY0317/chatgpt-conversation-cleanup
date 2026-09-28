@@ -26,9 +26,13 @@ class DesktopCatalogRefreshResult:
     missing_ids: frozenset[str]
 
 
-def require_desktop_catalog_refresh(platform: PlatformAdapter) -> None:
+def require_desktop_catalog_refresh(profile: Profile, platform: PlatformAdapter) -> None:
     require_catalog_write(platform)
-    supported, reason = platform.catalog_refresh_gate()
+    gate = getattr(platform, "profile_catalog_refresh_gate", None)
+    if gate is None:
+        supported, reason = platform.catalog_refresh_gate()
+    else:
+        supported, reason = gate(profile)
     require(supported, reason)
 
 
@@ -71,7 +75,7 @@ def prepare_desktop_catalog_refresh(
     of the authenticated history requests and of any catalog changes they imply.
     """
 
-    require_desktop_catalog_refresh(platform)
+    require_desktop_catalog_refresh(profile, platform)
     require(bool(account_id), "The signed-in ChatGPT workspace could not be identified.")
     _require_profile_stopped(profile, platform)
 
@@ -147,7 +151,7 @@ def desktop_catalog_refresh_result(
 ) -> DesktopCatalogRefreshResult | None:
     """Return authoritative Desktop evidence only after a newer full scan ends."""
 
-    require_desktop_catalog_refresh(platform)
+    require_desktop_catalog_refresh(profile, platform)
     require(request.profile_id == profile.id, "Desktop refresh request belongs to another profile.")
 
     path = profile.root / "sqlite/codex-dev.db"

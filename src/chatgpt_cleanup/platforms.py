@@ -62,6 +62,9 @@ class PlatformAdapter:
     def catalog_refresh_gate(self) -> tuple[bool, str]:
         return False, f"Desktop catalog refresh is not verified on {self.display_name}."
 
+    def profile_catalog_refresh_gate(self, profile: "Profile") -> tuple[bool, str]:
+        return self.catalog_refresh_gate()
+
 
 @dataclass(frozen=True)
 class MacOSAdapter(PlatformAdapter):
@@ -214,6 +217,53 @@ class MacOSAdapter(PlatformAdapter):
             f"ChatGPT build {current[0]} ({current[1]}) is not refresh-verified."
         )
 
+    def profile_catalog_refresh_gate(self, profile: "Profile") -> tuple[bool, str]:
+        if profile.provider == "official":
+            return self.catalog_refresh_gate()
+        if profile.provider != "plura-desktop":
+            return False, f"Fresh Desktop reconciliation is not verified for {profile.provider}."
+
+        suffix = profile.id.removeprefix("profile")
+        if not suffix.isdigit():
+            return False, "Could not identify the Plura profile runtime."
+        manifest = (
+            self.home
+            / "Library/Application Support/PluraDesktop"
+            / f"profile-{int(suffix)}-install-manifest.json"
+        )
+        try:
+            import json
+
+            data = json.loads(manifest.read_text())
+            executable = Path(data["app_executable"])
+            info_path = executable.parents[2] / "Contents/Info.plist"
+            info = plistlib.loads(info_path.read_bytes())
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            return False, "Could not verify the Plura ChatGPT runtime build."
+        expected_id = f"local.plura-desktop.profile{int(suffix)}"
+        expected_root = self.home / f".codex-profile{int(suffix)}"
+        expected_data_root = (
+            self.home / f"Library/Application Support/Codex-Profile{int(suffix)}"
+        )
+        if not (
+            data.get("ready") is True
+            and data.get("profile_index") == int(suffix)
+            and data.get("id") == expected_id
+            and profile.root == expected_root
+            and profile.desktop_data_root == expected_data_root
+            and executable.is_file()
+        ):
+            return False, "The Plura profile manifest is not trusted."
+        short = info.get("CFBundleShortVersionString")
+        build = info.get("CFBundleVersion")
+        current = (short, build) if isinstance(short, str) and isinstance(build, str) else None
+        verified = {("26.924.22138", "11645")}
+        if current in verified:
+            return True, f"refresh-verified Plura ChatGPT build {short} ({build})"
+        if current is None:
+            return False, "The Plura ChatGPT runtime build could not be read."
+        return False, f"Plura ChatGPT build {short} ({build}) is not refresh-verified."
+
 
 @dataclass(frozen=True)
 class WindowsAdapter(PlatformAdapter):
@@ -261,6 +311,9 @@ class WindowsAdapter(PlatformAdapter):
 
     def catalog_refresh_gate(self) -> tuple[bool, str]:
         return False, "Windows Desktop catalog refresh is not yet build-verified."
+
+    def profile_catalog_refresh_gate(self, profile: "Profile") -> tuple[bool, str]:
+        return self.catalog_refresh_gate()
 
 
 def current_platform(*, home: Path | None = None) -> PlatformAdapter:

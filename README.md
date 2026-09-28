@@ -126,7 +126,7 @@ Local-list cleanup follows this order:
 2. scan each selected profile independently;
 3. collect structured evidence and optional live evidence when available;
 4. classify every local ChatGPT row instead of hiding unverified rows;
-5. when supported and useful, optionally queue a fresh Desktop-owned full reconciliation for still-uncertain official-profile rows, then re-read the catalog only after that full pass is proven complete;
+5. when supported and useful, first queue a fresh Desktop-owned full reconciliation for stale or uncertain rows, then re-read the catalog only after that full pass is proven complete;
 6. preselect confirmed local leftovers or explicitly review/select local entries;
 7. ask the user to quit ChatGPT normally before cleanup is applied;
 8. require a final explicit confirmation;
@@ -152,7 +152,7 @@ Archived Codex deletion is a separate engine:
 
 One profile: no profile selector is shown.
 
-Several verified profiles: one operation can target multiple profiles. Each profile is still previewed, revalidated and applied sequentially. Arbitrary `.codex-*` directories are not trusted as profiles merely because they exist. The fresh Desktop-owned reconciliation path is currently intentionally limited to the verified official-profile lifecycle; alternate profile providers keep the existing evidence/manual-review flow until their launch and sync ownership contracts are independently verified.
+Several verified profiles: one operation can target multiple profiles. Each profile is still previewed, revalidated and applied sequentially. Arbitrary `.codex-*` directories are not trusted as profiles merely because they exist. Fresh Desktop-owned reconciliation is enabled only for provider/build combinations whose launch, data-root ownership and full-sync behavior have been verified. The normal official profile and the current Plura isolated-profile runtime are verified independently; unknown/legacy providers keep the existing evidence/manual-review flow.
 
 ## Safety boundary
 
