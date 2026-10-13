@@ -9,7 +9,7 @@ import sqlite3
 import shutil
 import uuid
 
-from .platforms import PlatformAdapter, PlatformError
+from .platforms import PlatformAdapter, PlatformError, require_profile_stopped
 from .profiles import Profile
 
 
@@ -384,7 +384,7 @@ def evict_catalog(
     require(selected, "No catalog entries selected.")
     require_catalog_write(platform)
     try:
-        platform.require_desktop_stopped()
+        require_profile_stopped(platform, profile)
     except PlatformError as error:
         raise SafetyError(str(error)) from error
     root = profile.root
@@ -408,7 +408,7 @@ def evict_catalog(
         db.execute("BEGIN IMMEDIATE")
         catalog_columns = write_schema(db)
         try:
-            platform.require_desktop_stopped()
+            require_profile_stopped(platform, profile)
         except PlatformError as error:
             db.rollback()
             raise SafetyError(str(error)) from error
@@ -515,7 +515,7 @@ def restore_catalog(
 ):
     require_catalog_write(platform)
     try:
-        platform.require_desktop_stopped()
+        require_profile_stopped(platform, profile)
     except PlatformError as error:
         raise SafetyError(str(error)) from error
     root = profile.root

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -14,7 +15,24 @@ if TYPE_CHECKING:
 
 
 class PlatformError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, process_kind: str | None = None, pid: int | None = None):
+        super().__init__(message)
+        # Safe, structured details only. Never retain command lines or environment.
+        self.process_kind = process_kind
+        self.pid = pid
+
+
+def require_profile_stopped(platform, profile: "Profile") -> None:
+    """Protect only the selected profile's storage, never unrelated profiles.
+
+    Third-party/test adapters can retain the conservative global check when
+    they cannot attest which process owns a particular profile.
+    """
+    checker = getattr(platform, "require_profile_desktop_stopped", None)
+    if checker is None:
+        platform.require_desktop_stopped()
+    else:
+        checker(profile)
 
 
 @dataclass(frozen=True)
@@ -68,6 +86,13 @@ class PlatformAdapter:
     def launch_profile_desktop(self, profile: "Profile") -> tuple[bool, str]:
         return False, f"Automatic profile launch is not supported on {self.display_name}."
 
+    def desktop_restore_plan(self, profiles: list["Profile"]) -> dict[str, str]:
+        """Read-only initial app-state capture. Unsupported platforms fail closed."""
+        return {}
+
+    def request_normal_desktop_quit(self, profile: "Profile") -> tuple[bool, str]:
+        return False, "Normal quit is not verified for this runtime."
+
 
 @dataclass(frozen=True)
 class MacOSAdapter(PlatformAdapter):
@@ -92,6 +117,69 @@ class MacOSAdapter(PlatformAdapter):
             self.home / "Applications/ChatGPT Repair Kit.command",
         )
 
+    def desktop_restore_plan(self, profiles: list["Profile"]) -> dict[str, str]:
+        """Identify only provable standalone app launches for automatic reopening.
+
+        An app launched by a separate profile manager can depend on its session
+        credentials. Launching the ordinary app cannot restore that authority.
+        """
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,args="],
+            capture_output=True, text=True, check=True,
+        )
+        official = str(self.app_path / "Contents/MacOS/ChatGPT")
+        plan: dict[str, str] = {}
+        for raw in result.stdout.splitlines():
+            parts = raw.strip().split(maxsplit=1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            line = parts[1]
+            for profile in profiles:
+                marker = (
+                    f"--user-data-dir={profile.desktop_data_root}"
+                    if profile.desktop_data_root else None
+                )
+                if profile.provider == "official":
+                    if line == official:
+                        if plan.get(profile.id) != "managed":
+                            plan[profile.id] = "standalone"
+                    elif line.startswith(official + " ") and (
+                        "--user-data-dir=" not in line
+                        or marker is None
+                        or marker in line
+                    ):
+                        # Even harmless command-line flags may belong to a
+                        # separate launcher; never reproduce them blindly.
+                        plan[profile.id] = "managed"
+                elif marker and marker in line and "/Contents/MacOS/ChatGPT" in line:
+                    plan[profile.id] = "managed"
+        return plan
+
+    def request_normal_desktop_quit(self, profile: "Profile") -> tuple[bool, str]:
+        """Quit only a simple standalone official app with explicit user consent."""
+        if profile.provider != "official":
+            return False, "This profile is controlled by another app; quit it there."
+        try:
+            if self.desktop_restore_plan([profile]).get(profile.id) != "standalone":
+                return False, "This profile is not a standalone ChatGPT launch."
+            info = plistlib.loads(
+                (self.app_path / "Contents/Info.plist").read_bytes()
+            )
+            bundle_id = info.get("CFBundleIdentifier")
+            if not isinstance(bundle_id, str) or not re.fullmatch(
+                r"com\.openai\.[A-Za-z0-9.-]+", bundle_id
+            ):
+                return False, "The official ChatGPT application identity is unverified."
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", f'tell application id "{bundle_id}" to quit'],
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            if result.returncode != 0:
+                return False, "ChatGPT did not accept its normal quit request."
+            return True, "Normal quit requested; waiting for ChatGPT to exit."
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            return False, "Normal quit could not be requested safely."
+
     def codex_cli(self) -> Path:
         override = os.environ.get("CHATGPT_CLEANUP_CODEX")
         if override:
@@ -106,15 +194,25 @@ class MacOSAdapter(PlatformAdapter):
 
     def require_desktop_stopped(self) -> None:
         result = subprocess.run(
-            ["/bin/ps", "-axo", "comm=,args="],
+            ["/bin/ps", "-axo", "pid=,args="],
             capture_output=True,
             text=True,
             check=True,
         )
-        for line in result.stdout.splitlines():
-            if "/Contents/MacOS/ChatGPT" in line or ("codex" in line and "app-server" in line):
+        for raw in result.stdout.splitlines():
+            parts = raw.strip().split(maxsplit=1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            pid, line = int(parts[0]), parts[1]
+            process_kind = (
+                "chatgpt" if "/Contents/MacOS/ChatGPT" in line else
+                "codex-app-server" if "codex" in line and "app-server" in line else None
+            )
+            if process_kind:
                 raise PlatformError(
-                    "Quit ChatGPT and Codex app-server normally before applying changes."
+                    f"ChatGPT or Codex app-server is still running (PID {pid}; {process_kind}).",
+                    process_kind=process_kind,
+                    pid=pid,
                 )
 
     def require_profile_desktop_stopped(self, profile: "Profile") -> None:
@@ -146,7 +244,9 @@ class MacOSAdapter(PlatformAdapter):
                     ).stdout
                 except (OSError, subprocess.SubprocessError):
                     raise PlatformError(
-                        "Could not verify which ChatGPT profile owns Codex app-server."
+                        f"Could not verify which profile owns Codex app-server (PID {pid}).",
+                        process_kind="codex-app-server",
+                        pid=int(pid),
                     )
                 codex_home = f"CODEX_HOME={profile.root}"
                 home_tokens = [
@@ -161,8 +261,22 @@ class MacOSAdapter(PlatformAdapter):
                     # default ~/.codex. It cannot own an isolated alternate
                     # profile rooted elsewhere (for example ~/.codex-profile2).
                     continue
+                from_external_runtime = not line.startswith(
+                    str(self.app_path / "Contents/Resources/")
+                )
+                owner_hint = (
+                    " An external runtime may own it; close that session through "
+                    "its own normal controls, not by killing its PID."
+                    if from_external_runtime else ""
+                )
                 raise PlatformError(
-                    f"Quit {profile.display_name}'s Codex app-server normally before applying changes."
+                    f"Codex app-server is using {profile.display_name}'s data "
+                    f"(PID {pid}).{owner_hint}",
+                    process_kind=(
+                        "external-codex-app-server" if from_external_runtime
+                        else "codex-app-server"
+                    ),
+                    pid=int(pid),
                 )
             if "/Contents/MacOS/ChatGPT" not in line:
                 continue
@@ -175,12 +289,16 @@ class MacOSAdapter(PlatformAdapter):
                     or line.startswith(official_executable + " ")
                 ) and (marker is None or marker in line or "--user-data-dir=" not in line):
                     raise PlatformError(
-                        f"Quit {profile.display_name} normally before applying changes."
+                        f"Quit {profile.display_name} normally (PID {pid}).",
+                        process_kind="chatgpt",
+                        pid=int(pid),
                     )
                 continue
             if marker is not None and marker in line:
                 raise PlatformError(
-                    f"Quit {profile.display_name} normally before applying changes."
+                    f"Quit {profile.display_name} normally (PID {pid}).",
+                    process_kind="chatgpt",
+                    pid=int(pid),
                 )
 
     def app_build(self) -> tuple[str, str] | None:

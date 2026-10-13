@@ -94,6 +94,12 @@ Interactive mode keeps the main menu narrow:
 
 Strongly confirmed leftovers are selected by default. Press Enter or `A` to continue with those confirmed entries, `R` to review every local ChatGPT Desktop entry, or `C` to cancel. Manual review accepts explicit numbers and ranges such as `1-8,11,14-18`; it never silently selects all unverified entries. Arrow-key input is ignored with a prompt instead of terminating the program.
 
+If no leftovers are confirmed, possible leftovers (when any exist) are displayed by title as **preview only**; none is auto-selected. Press `R` for the full numbered local catalog and explicit manual selection. Protected entries remain unselectable.
+
+For local catalog writes, **every runtime sharing the selected profile's Codex/Desktop data must be closed normally first**. This includes a separately managed Codex app-server (for example, one running inside a development runtime) even if the ChatGPT window is already closed. The blocker screen now identifies the process type and PID and records bounded, private, content-free diagnostics. Do not kill a shared app-server from a terminal: close its owning session through that product's supported controls.
+
+After the **final local-cleanup confirmation**, a verified standalone official macOS ChatGPT app can receive **one normal quit request** through the standard macOS application controls. It may ask to save or finish open work; Cleanup never kills it. If it is still running, the blocker prompt offers `Q` for a normal-quit request (if not already attempted), or cancellation. A separately managed runtime is never quit this way. On completion or cancellation, a previously open, provably standalone official ChatGPT app is reopened only if it remains closed and its data is available. A session launched through an external profile manager must instead be reopened through that manager: a normal app launch cannot recreate its special routing or connection. The **restore step** never opens a profile that was closed at the start; an explicitly requested fresh reconciliation may separately open Desktop to run its scan.
+
 Option 1 works from ChatGPT Desktop's local conversation catalog, not only from rows currently visible in the sidebar. A server-deleted branch or other stale local record can therefore be offered for cleanup even after the sidebar has already stopped showing it. Cleanup removes only that exact local catalog record; it does not delete a server conversation.
 
 ## How local ChatGPT cleanup is decided
@@ -128,15 +134,15 @@ Local-list cleanup follows this order:
 4. classify every local ChatGPT row instead of hiding unverified rows;
 5. when supported and useful, first queue a fresh Desktop-owned full reconciliation for stale or uncertain rows, automatically launch the verified profile, monitor progress, and re-read the catalog only after that full pass is proven complete; recently completed full scans are reused and multiple independent profiles are queued before waiting so their scans can overlap;
 6. preselect confirmed local leftovers or explicitly review/select local entries;
-7. ask the user to quit ChatGPT normally before cleanup is applied;
-8. require a final explicit confirmation;
+7. require a final explicit confirmation of the exact local-cleanup selection **before** changing app state;
+8. when applicable, request normal quit once for a verified standalone macOS ChatGPT app; otherwise wait for its owner to close the affected profile normally;
 9. re-read and compare the exact selected catalog rows inside the write path;
 10. create a private recovery record;
 11. apply the same authoritative-removal bookkeeping used by the current Desktop catalog: advance the host observation sequence, preserve a scan tombstone when a checkpoint exists, remove only the exact row, and advance the catalog revision when a visible row was removed.
 
 The server is not queried a second time after selection. This avoids bursty duplicate reads and leaves the destructive safety check to the exact local-row comparison immediately before the write.
 
-The tool never terminates or restarts ChatGPT itself.
+The tool never force-terminates ChatGPT or arbitrary background processes. The optional macOS normal-quit and restore path is confined to a verified standalone official app and the user's approved local-cleanup workflow. An unrelated application using the same data root must be closed through its own interface. Data-write guards still verify that the selected profile is stopped immediately before mutation.
 
 Archived Codex deletion is a separate engine:
 
@@ -160,7 +166,7 @@ Several verified profiles: one operation can target multiple profiles. Each prof
 - Native Codex history/lineage, authentication and provider tables are never rewritten directly. Archived Codex deletion delegates the irreversible operation to official app-server `thread/delete` and uses local state only for preview, dependency planning and verification.
 - Direct catalog mutation requires an exact known schema and a platform/build write gate.
 - Preview changes, profile/account mismatch, unknown schemas/builds, symlinks, recovery conflicts and ambiguous request/command results stop the operation.
-- ChatGPT/Codex Desktop must be closed normally before destructive operations. The optional live read-only scan may run while ChatGPT is open; the tool then waits for the user to close it. A supported fresh reconciliation also briefly requires Desktop to be closed while only its sync scheduling/scratch state is reset; the user then reopens Desktop and Desktop itself performs the network reconciliation. For archived deletion, the utility starts its own short-lived official Codex app-server over stdio after Desktop is closed and releases it by closing stdio when the operation ends.
+- The affected ChatGPT/Codex profile data must not be in use during destructive operations. The optional live read-only scan may run while ChatGPT is open. An approved local cleanup can request a normal quit of a verified standalone official macOS app, but never forces external runtimes to stop. A supported fresh reconciliation similarly requires a brief stop while only its scheduling/scratch state is reset, then launches the verified Desktop where supported so Desktop itself performs the authenticated network reconciliation. For archived deletion, the utility starts its own short-lived official Codex app-server over stdio after the affected profile is closed and releases it by closing stdio when the operation ends.
 - Recovery files may contain conversation metadata and are stored privately outside the repository.
 - Tests use synthetic homes only. Real user conversations are not deleted for testing.
 

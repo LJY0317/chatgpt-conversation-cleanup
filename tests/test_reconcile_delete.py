@@ -154,6 +154,22 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         self.assertIsNone(_parse_number_selection("1-3,3", 5))
         self.assertIsNone(_parse_number_selection("1-9", 5))
 
+    def test_possible_leftover_titles_preview_without_auto_selection(self):
+        rows = [
+            {"thread_id": "possible", "display_title": "의심되는 대화", "missing_candidate": 1},
+            {"thread_id": "unknown", "display_title": "확인되지 않은 대화", "missing_candidate": 0},
+        ]
+        assessed = assess_catalog_rows(rows, {}, None)
+        output = io.StringIO()
+        with patch("builtins.input", return_value="c"), contextlib.redirect_stdout(output):
+            self.assertEqual(choose_cleanup_assessments(assessed), [])
+        self.assertIn("의심되는 대화", output.getvalue())
+        self.assertIn("none selected", output.getvalue())
+        self.assertNotIn("확인되지 않은 대화", output.getvalue())
+        with patch("builtins.input", side_effect=["r", "1"]), contextlib.redirect_stdout(io.StringIO()):
+            selected = choose_cleanup_assessments(assessed)
+        self.assertEqual([row["thread_id"] for row in selected], ["possible"])
+
     def test_reconcile_live_present_and_inaccessible_are_protected(self):
         rows = [
             {"thread_id": "present", "display_title": "Present", "missing_candidate": 1},

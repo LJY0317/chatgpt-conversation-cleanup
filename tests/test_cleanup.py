@@ -17,6 +17,7 @@ from chatgpt_cleanup.__main__ import (
     _cleanup_candidates_batch,
     _collect_work,
     _wait_for_desktop_to_close,
+    apply_batch,
     choose,
     display,
     doctor_data,
@@ -541,6 +542,26 @@ class CleanupTests(unittest.TestCase):
         ):
             adapter.require_profile_desktop_stopped(profile)
 
+    def test_macos_stop_guard_identifies_external_codex_runtime(self):
+        adapter = MacOSAdapter(home=self.home)
+        profile = Profile(
+            "default", "ChatGPT", self.root, "official",
+            desktop_data_root=self.home / "Library/Application Support/Codex",
+        )
+        listing = type("ProcessResult", (), {"stdout":
+            "77725 /fixture/external-runtime/bin/codex app-server --listen ws://127.0.0.1:0\n"
+        })()
+        detail = type("ProcessResult", (), {"stdout":
+            f"codex app-server CODEX_HOME={self.root}\n"
+        })()
+        with patch("chatgpt_cleanup.platforms.subprocess.run",
+                   side_effect=[listing, detail]):
+            with self.assertRaises(c.PlatformError) as raised:
+                adapter.require_profile_desktop_stopped(profile)
+        self.assertEqual(raised.exception.pid, 77725)
+        self.assertEqual(raised.exception.process_kind, "external-codex-app-server")
+        self.assertIn("external runtime", str(raised.exception))
+
     def test_sessions_expose_identity_metadata_when_available(self):
         row = c.sessions(self.profile)[0]
         self.assertEqual(row["creator_user_id"], "user-test")
@@ -1012,6 +1033,163 @@ class CleanupTests(unittest.TestCase):
         ):
             self.assertFalse(_wait_for_desktop_to_close(Platform()))
 
+    def test_cleanup_wait_scopes_checks_to_selected_profiles(self):
+        calls = []
+
+        class Platform:
+            def require_desktop_stopped(self):
+                raise AssertionError("Global stop check should not run")
+
+            def require_profile_desktop_stopped(self, profile):
+                calls.append(profile.id)
+
+        self.assertTrue(_wait_for_desktop_to_close(
+            Platform(), profiles=[self.profile]
+        ))
+        self.assertEqual(calls, ["default"])
+
+    def test_cleanup_stop_diagnostic_is_bounded_and_redacted(self):
+        from chatgpt_cleanup.diagnostics import record_blocked_check
+
+        class Platform:
+            data_root = self.home / "diagnostic-fixture"
+
+        for _ in range(70):
+            record_blocked_check(
+                Platform(), operation="cleanup", profiles=[self.profile],
+                error=c.PlatformError("secret command path", process_kind="codex-app-server", pid=123),
+            )
+        path = Platform.data_root / "diagnostics/desktop-stop.jsonl"
+        lines = path.read_text().splitlines()
+        self.assertEqual(len(lines), 64)
+        self.assertNotIn("secret", path.read_text())
+        self.assertEqual(json.loads(lines[-1])["pid"], 123)
+
+    def test_macos_reopen_plan_only_trusts_standalone_official_launch(self):
+        adapter = MacOSAdapter(home=self.home)
+        official = Profile("default", "ChatGPT", self.root, "official",
+                           desktop_data_root=self.home / "Library/Application Support/Codex")
+        other = Profile("profile2", "Profile 2", self.home / ".codex-profile2",
+                        "plura-desktop", desktop_data_root=self.home / "Library/Application Support/Codex-Profile2")
+        exe = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        other_exe = "/Applications/Profile 2.app/Contents/MacOS/ChatGPT"
+        listing = type("ProcessResult", (), {"stdout":
+            f"100 {exe}\n"
+            f"200 {other_exe} --user-data-dir={other.desktop_data_root}\n"
+        })()
+        with patch("chatgpt_cleanup.platforms.subprocess.run", return_value=listing):
+            self.assertEqual(adapter.desktop_restore_plan([official, other]),
+                             {"default": "standalone", "profile2": "managed"})
+        listing = type("ProcessResult", (), {"stdout":
+            f"300 {exe} --user-data-dir={official.desktop_data_root}\n"
+        })()
+        with patch("chatgpt_cleanup.platforms.subprocess.run", return_value=listing):
+            self.assertEqual(adapter.desktop_restore_plan([official, other]),
+                             {"default": "managed"})
+
+    def test_macos_normal_quit_only_for_verified_standalone_app(self):
+        adapter = MacOSAdapter(home=self.home)
+        official_app = self.home / "OfficialChatGPT.app"
+        contents = official_app / "Contents"
+        contents.mkdir(parents=True)
+        (contents / "Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleIdentifier": "com.openai.chat"})
+        )
+        profile = Profile("default", "ChatGPT", self.root, "official")
+        listing = type("ProcessResult", (), {"stdout":
+            f"100 {official_app}/Contents/MacOS/ChatGPT\n"
+        })()
+        accepted = type("ProcessResult", (), {"returncode": 0})()
+        with (
+            patch.dict(os.environ, {"CHATGPT_CLEANUP_APP": str(official_app)}),
+            patch("chatgpt_cleanup.platforms.subprocess.run",
+                  side_effect=[listing, accepted]) as runner,
+        ):
+            self.assertTrue(adapter.request_normal_desktop_quit(profile)[0])
+            self.assertEqual(runner.call_args.args[0][0], "/usr/bin/osascript")
+            self.assertIn("com.openai.chat", runner.call_args.args[0][-1])
+        with patch("chatgpt_cleanup.platforms.subprocess.run", return_value=listing) as runner:
+            alternate = Profile("profile2", "Profile 2", self.root, "plura-desktop")
+            self.assertFalse(adapter.request_normal_desktop_quit(alternate)[0])
+            runner.assert_not_called()
+
+    def test_cleanup_normal_quit_requires_explicit_q(self):
+        class Platform:
+            data_root = self.home / "diagnostic-fixture"
+            running = True
+            requested = 0
+
+            def require_profile_desktop_stopped(self, profile):
+                if self.running:
+                    raise c.PlatformError("still running", process_kind="chatgpt", pid=100)
+
+            def request_normal_desktop_quit(self, profile):
+                self.requested += 1
+                self.running = False
+                return True, "Normal quit requested."
+
+        platform = Platform()
+        with (
+            patch("builtins.input", side_effect=["q"]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertTrue(_wait_for_desktop_to_close(platform, profiles=[self.profile]))
+        self.assertEqual(platform.requested, 1)
+
+    def test_external_runtime_blocker_never_offers_auto_quit(self):
+        class Platform:
+            data_root = self.home / "diagnostic-fixture"
+
+            def require_profile_desktop_stopped(self, profile):
+                raise c.PlatformError(
+                    "shared external runtime", process_kind="external-codex-app-server", pid=77725
+                )
+
+            def request_normal_desktop_quit(self, profile):
+                raise AssertionError("Must not request quit for externally owned processes")
+
+        with (
+            patch("builtins.input", return_value="c") as prompt,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertFalse(_wait_for_desktop_to_close(
+                Platform(), profiles=[self.profile]
+            ))
+        self.assertIn("through its own controls", prompt.call_args.args[0])
+        self.assertNotIn("Q to request", prompt.call_args.args[0])
+
+    def test_cleanup_reopens_only_verified_previously_running_session(self):
+        original = [
+            self.profile,
+            Profile("profile2", "Profile 2", self.home / ".codex-profile2", "plura-desktop"),
+            Profile("profile3", "Profile 3", self.home / ".codex-profile3", "plura-desktop"),
+        ]
+
+        class Platform:
+            def __init__(self):
+                self.plans = [{"default": "standalone", "profile2": "managed"}, {}]
+                self.launched = []
+
+            def require_desktop_stopped(self):
+                return None
+
+            def desktop_restore_plan(self, profiles):
+                return self.plans.pop(0)
+
+            def launch_profile_desktop(self, profile):
+                self.launched.append(profile.id)
+                return True, "opened"
+
+        platform = Platform()
+        with (
+            patch("chatgpt_cleanup.__main__._apply_batch_selected") as work,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            apply_batch("catalog", original, platform)
+        work.assert_called_once()
+        self.assertEqual(platform.launched, ["default"])
+        self.assertIn("managed by another app", output.getvalue())
+
     def test_read_tolerates_version_drift_but_writes_reject_it(self):
         self.mutate("PRAGMA user_version=35")
         self.assertEqual(len(c.catalog(self.profile)), 2)
@@ -1055,6 +1233,35 @@ class CleanupTests(unittest.TestCase):
         )
         with self.assertRaises(c.SafetyError):
             self.restore(backup)
+
+    def test_direct_catalog_write_checks_only_the_selected_profiles_owners(self):
+        class GuardedPlatform:
+            key = "test"
+            display_name = "Test"
+
+            def __init__(self):
+                self.checked = []
+
+            def catalog_write_gate(self):
+                return True, "synthetic verified build"
+
+            def require_desktop_stopped(self):
+                raise AssertionError("Unrelated Desktop process should not block")
+
+            def require_profile_desktop_stopped(self, profile):
+                self.checked.append(profile.id)
+
+        guarded = GuardedPlatform()
+        backup = c.evict_catalog(
+            self.profile,
+            c.catalog(self.profile),
+            recovery=self.rec,
+            platform=guarded,
+        )
+        self.assertEqual(guarded.checked, ["default", "default"])
+        self.assertEqual(c.catalog(self.profile), [])
+        self.assertTrue(c.restore_catalog(self.profile, backup, platform=guarded))
+        self.assertEqual(guarded.checked, ["default", "default", "default"])
 
     def test_current_catalog_layout_with_trial_column_round_trips(self):
         self.mutate(

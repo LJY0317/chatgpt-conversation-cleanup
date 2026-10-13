@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .appserver import AppServerError, AppServerSession
 from .core import SafetyError, require, safe_path, sessions
-from .platforms import PlatformAdapter, PlatformError
+from .platforms import PlatformAdapter, PlatformError, require_profile_stopped
 from .profiles import Profile
 
 
@@ -229,7 +229,7 @@ def delete_archived_codex(
     session_factory=AppServerSession,
 ) -> CodexDeletePlan:
     try:
-        platform.require_desktop_stopped()
+        require_profile_stopped(platform, profile)
     except PlatformError as error:
         raise SafetyError(str(error)) from error
 
@@ -256,7 +256,7 @@ def execute_codex_delete_plan(
     session_factory=AppServerSession,
 ) -> None:
     try:
-        platform.require_desktop_stopped()
+        require_profile_stopped(platform, profile)
     except PlatformError as error:
         raise SafetyError(str(error)) from error
 

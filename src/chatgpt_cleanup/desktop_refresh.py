@@ -5,7 +5,7 @@ import json
 import time
 
 from .core import database, require, require_catalog_write, write_schema
-from .platforms import PlatformAdapter
+from .platforms import PlatformAdapter, require_profile_stopped
 from .profiles import Profile
 
 
@@ -146,11 +146,7 @@ def require_desktop_catalog_refresh(profile: Profile, platform: PlatformAdapter)
 
 
 def _require_profile_stopped(profile: Profile, platform: PlatformAdapter) -> None:
-    checker = getattr(platform, "require_profile_desktop_stopped", None)
-    if checker is None:
-        platform.require_desktop_stopped()
-    else:
-        checker(profile)
+    require_profile_stopped(platform, profile)
 
 
 def _workspace_host(db, account_id: str) -> str:

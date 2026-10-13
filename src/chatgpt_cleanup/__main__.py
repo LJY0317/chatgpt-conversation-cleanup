@@ -38,6 +38,11 @@ from .evidence import (
     desktop_failure_evidence_many,
 )
 from .locking import operation_lock
+from .lifecycle import (
+    capture_initial_desktops,
+    restore_initial_desktops,
+    wait_for_desktop_to_close as _wait_for_desktop_to_close,
+)
 from .identity import enrich_identities
 from .platforms import PlatformError, current_platform
 from .profiles import Profile, discover_profiles
@@ -389,9 +394,17 @@ def choose_cleanup_assessments(assessments: list[CatalogAssessment]):
                 break
             print("Choose Enter/A, R, or C.")
     else:
+        possible = [
+            item for item in assessments
+            if item.status == ReconcileStatus.SUSPECTED
+        ]
+        if possible:
+            print("\nPossible leftovers (preview only; none selected)\n")
+            _show_assessments(possible)
         answer = input(
             "\nNo leftovers could be confirmed automatically. "
-            "Press R to review the local Desktop list manually, or C to cancel: "
+            "Press R for the full numbered Desktop list and manual selection, "
+            "or C to cancel: "
         ).strip().lower()
         if answer != "r":
             return []
@@ -852,7 +865,8 @@ def _queue_desktop_refresh(
         answer = input(
             f"\n{profile.display_name}: {candidate_count} local chat(s) look stale or still need reconciliation. "
             "ChatGPT Desktop can repair its own local list with a fresh server reconciliation first. "
-            "This can take several minutes and requires closing and reopening ChatGPT once. "
+            "This can take several minutes and may request a normal quit "
+            "of a standalone ChatGPT app before reopening it. "
             "Press Enter or R to run the recommended refresh, or S to skip it: "
         ).strip().lower()
         if answer in {"", "r", "run", "y", "yes"}:
@@ -861,7 +875,10 @@ def _queue_desktop_refresh(
             return None
         print("Press Enter/R to refresh, or S to skip.")
 
-    if not _wait_for_desktop_to_close(platform, purpose="refresh", profile=profile):
+    if not _wait_for_desktop_to_close(
+        platform, purpose="refresh", profile=profile,
+        approved_normal_quit=True,
+    ):
         return None
 
     request = refresh_prepare(profile, account_id, platform)
@@ -1010,41 +1027,7 @@ def _collect_work(
     return work
 
 
-def _wait_for_desktop_to_close(platform, *, purpose="cleanup", profile=None):
-    first = True
-    while True:
-        try:
-            if profile is not None:
-                checker = getattr(platform, "require_profile_desktop_stopped", None)
-                if checker is None:
-                    platform.require_desktop_stopped()
-                else:
-                    checker(profile)
-            else:
-                platform.require_desktop_stopped()
-            return True
-        except PlatformError:
-            if first:
-                if purpose == "refresh":
-                    print(
-                        "\nQuit ChatGPT so a fresh Desktop reconciliation can be queued. "
-                        "No conversation row will be edited while ChatGPT is open."
-                    )
-                else:
-                    print(
-                        "\nQuit ChatGPT before the cleanup is applied. "
-                        "Your selection is ready."
-                    )
-                first = False
-            answer = input(
-                "When ChatGPT is fully closed, press Enter to continue, "
-                "or C to cancel: "
-            ).strip().lower()
-            if answer in {"c", "cancel"}:
-                return False
-
-
-def apply_batch(
+def _apply_batch_selected(
     action,
     profiles,
     platform,
@@ -1063,7 +1046,13 @@ def apply_batch(
     if not selected_work:
         print("Nothing selected. Nothing was changed.")
         return
-    if not _wait_for_desktop_to_close(platform):
+    if action == "catalog" and not _batch_summary(action, selected_work):
+        print("Cancelled. Nothing was changed.")
+        return
+    if not _wait_for_desktop_to_close(
+        platform, profiles=[profile for profile, _ in selected_work],
+        approved_normal_quit=action == "catalog",
+    ):
         print("Cancelled. Nothing was changed.")
         return
 
@@ -1073,7 +1062,7 @@ def apply_batch(
         for profile, rows in selected_work:
             delete_plans[profile.id] = preview_codex_delete(profile, rows, platform)
 
-    if not _batch_summary(action, selected_work, delete_plans=delete_plans):
+    if action == "delete" and not _batch_summary(action, selected_work, delete_plans=delete_plans):
         print("Cancelled. Nothing was changed.")
         return
     directory = recovery_root(platform)
@@ -1105,6 +1094,26 @@ def apply_batch(
         print(f"  ✓ {name}: {detail}")
     if action == "catalog":
         print("  An undo point was saved in case you need to restore these local entries.")
+
+
+def apply_batch(
+    action,
+    profiles,
+    platform,
+    *,
+    evidence_many_reader=desktop_failure_evidence_many,
+    presence_probe=probe_conversation_presence,
+):
+    initial_state = capture_initial_desktops(platform, profiles)
+    try:
+        return _apply_batch_selected(
+            action, profiles, platform,
+            evidence_many_reader=evidence_many_reader,
+            presence_probe=presence_probe,
+        )
+    finally:
+        if initial_state:
+            restore_initial_desktops(platform, profiles, initial_state)
 
 
 def doctor_data(profile, platform):

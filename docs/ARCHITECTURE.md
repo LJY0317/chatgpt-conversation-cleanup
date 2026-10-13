@@ -53,7 +53,7 @@ To avoid paying the same full-history cost repeatedly, a full reconciliation com
 
 This path is provider/build gated. It is enabled for the verified official-profile lifecycle and for the current verified Plura isolated-profile lifecycle. Other multi-profile providers remain on the existing evidence/manual-review path until their launch, process ownership and catalog-refresh contracts are separately verified.
 
-The stop guard used by refresh is profile-scoped on macOS. A verified alternate runtime with its own `--user-data-dir`/`CODEX_HOME` and separate catalog may stay open while the official profile is queued, avoiding an unrelated second profile blocking reconciliation. A developer runtime that points at the selected profile's same Desktop data root or Codex home is treated as a co-owner and must stop. Destructive local cleanup keeps the stricter all-Desktop stop guard.
+The stop guard used by refresh and local catalog writes is profile-scoped on macOS. A verified alternate runtime with its own `--user-data-dir`/`CODEX_HOME` and separate catalog may stay open while the official profile is queued. An external runtime pointing to the selected profile's Desktop or Codex data is treated as a co-owner and must stop normally. The direct write path rechecks ownership before and within the SQLite transaction.
 
 ### Local-only mutation
 
@@ -94,6 +94,7 @@ Before every delete, the selected local row must still exactly match the preview
 
 - Single-profile is the default UX; extra profiles require verified providers.
 - Unknown schemas, builds, identities, symlinks or concurrent changes fail closed.
-- ChatGPT/Codex Desktop is never terminated or restarted by the utility.
+- The common cleanup engine does not depend on external profile managers. On macOS only, the platform adapter may request a normal quit of a provably standalone official ChatGPT app **after explicit user approval**; it never force-quits an app or a third-party-owned process. It can restore only the originally running standalone Desktop after checking that it is still safe to open. Unverified/managed sessions are left to their owner.
+- Local catalog cleanup presents the final selected-row confirmation before any optional normal-quit request. Cleanup still refuses a write while the affected profile's Desktop or app-server is active.
 - Recovery data is private local state and is excluded from Git.
 - Tests use synthetic homes; destructive development tests never target real conversations.
