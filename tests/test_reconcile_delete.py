@@ -718,6 +718,81 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         self.assertEqual(calls, ["target"])
         self.assertEqual(len(sessions(self.profile)), 1)
 
+    def test_native_delete_succeeds_even_if_chatgpt_desktop_is_running(self):
+        self.add_thread("archived", archived=1)
+        plan = preview_codex_delete(
+            self.profile, sessions(self.profile), self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+
+        class LiveDesktopPlatform(DeletePlatform):
+            def require_desktop_stopped(self):
+                raise AssertionError("The UI should remain open during native thread/delete.")
+
+            def require_profile_desktop_stopped(self, profile):
+                raise AssertionError("A running profile must not be force-stopped.")
+
+        calls = []
+        outcome = execute_codex_delete_plan(
+            self.profile, plan, LiveDesktopPlatform(self.home),
+            session_factory=self.factory(
+                FakeAppServer(calls=calls, delete_callback=self.delete_db_row)
+            ),
+        )
+        self.assertEqual(outcome.deleted_ids, ("archived",))
+        self.assertEqual(calls, ["archived"])
+
+    def test_unrelated_live_thread_update_does_not_cancel_archived_delete(self):
+        self.add_thread("archived", archived=1)
+        self.add_thread("active", archived=0)
+        plan = preview_codex_delete(
+            self.profile,
+            [r for r in sessions(self.profile) if r["archived"] == 1],
+            self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        db = sqlite3.connect(self.root / "state_5.sqlite")
+        with db:
+            db.execute("UPDATE threads SET updated_at=22 WHERE id='active'")
+        db.close()
+        result = execute_codex_delete_plan(
+            self.profile, plan, self.platform,
+            session_factory=self.factory(FakeAppServer(delete_callback=self.delete_db_row)),
+        )
+        self.assertEqual(result.deleted_ids, ("archived",))
+        self.assertEqual({r["id"] for r in sessions(self.profile)}, {"active"})
+
+    def test_owned_native_writer_is_protected_without_retrying_or_stopping_other_chats(self):
+        self.add_thread("writer-owned", archived=1)
+        self.add_thread("free", archived=1)
+        chosen = [
+            r for name in ("writer-owned", "free")
+            for r in sessions(self.profile) if r["id"] == name
+        ]
+        plan = preview_codex_delete(
+            self.profile, chosen, self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        calls = []
+        result = execute_codex_delete_plan(
+            self.profile, plan, self.platform,
+            session_factory=self.factory(
+                FakeAppServer(
+                    calls=calls,
+                    failures={"writer-owned": AppServerError(
+                        "thread writer-owned already has an active writer", code=-32600,
+                    )},
+                    delete_callback=self.delete_db_row,
+                ),
+            ),
+        )
+        self.assertEqual(calls, ["writer-owned", "free"])
+        self.assertEqual(result.deleted_ids, ("free",))
+        self.assertIn("writer-owned", result.protected)
+        self.assertEqual(
+            {r["id"] for r in sessions(self.profile)}, {"writer-owned"},
+        )
+
 
     def test_native_history_projection_residue_is_reported_not_repaired(self):
         thread_id = "00000000-0000-0000-0000-000000000002"

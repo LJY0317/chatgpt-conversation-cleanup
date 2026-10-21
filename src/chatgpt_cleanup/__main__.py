@@ -1058,12 +1058,16 @@ def _apply_batch_selected(
     if action == "catalog" and not _batch_summary(action, selected_work):
         print("Cancelled. Nothing was changed.")
         return
-    if not _wait_for_desktop_to_close(
-        platform, profiles=[profile for profile, _ in selected_work],
-        approved_normal_quit=action == "catalog",
-    ):
-        print("Cancelled. Nothing was changed.")
-        return
+    if action == "catalog":
+        # Direct local ChatGPT catalog writes still require exclusive profile
+        # ownership. Codex archival deletion below uses official thread/delete,
+        # whose own cross-process writer locks permit Desktop to remain open.
+        if not _wait_for_desktop_to_close(
+            platform, profiles=[profile for profile, _ in selected_work],
+            approved_normal_quit=True,
+        ):
+            print("Cancelled. Nothing was changed.")
+            return
 
     delete_plans = None
     if action == "delete":
@@ -1120,7 +1124,7 @@ def apply_batch(
     evidence_many_reader=desktop_failure_evidence_many,
     presence_probe=probe_conversation_presence,
 ):
-    initial_state = capture_initial_desktops(platform, profiles)
+    initial_state = capture_initial_desktops(platform, profiles) if action == "catalog" else {}
     try:
         return _apply_batch_selected(
             action, profiles, platform,

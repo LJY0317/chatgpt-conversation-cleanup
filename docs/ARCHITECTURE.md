@@ -99,10 +99,15 @@ layer around Codex's native deletion engine, not another deletion engine.**
 ### Native execution and failure isolation
 
 After the owner's final destructive confirmation, the exact local and native
-snapshots must still match the preview. Every operation passes the
-profile-scoped no-other-writers guard; neither the application nor external
-managers are force-closed. A short-lived, official, profile-bound app-server
-performs every irreversible `thread/delete`.
+**selected threads and spawned descendants** must still match the preview.
+Unrelated active chats may advance while Desktop is open without invalidating
+the exact archived selection. A short-lived, official, profile-bound app-server
+performs every irreversible `thread/delete` **while ChatGPT is allowed to
+remain open**. Codex itself coordinates across processes through per-thread
+writer/lifecycle locks; attempting to delete a loaded writer or live internal
+worker yields a native ownership refusal, not a license to force-stop it.
+Neither the application nor external managers are stopped by this engine.
+There is no direct external IPC connection to or patching of the Desktop app.
 
 A **definitive** native `-32600` fork-history-reference refusal is reported for
 that thread while other independently selected archived roots continue. If
@@ -110,6 +115,10 @@ another selected archived fork was then successfully removed, a single bounded
 second pass may attempt the previously refused root again. No other error
 is automatically retried: server timeouts, transport loss, unknown refusals,
 schema conflicts and partial/ambiguous outcomes stop immediately.
+An explicit native live-writer/internal-worker ownership refusal is instead
+reported as a protected thread, **not retried**. A newly discovered spawned
+descendant or change to selected thread metadata stops the operation. Unrelated
+new/updated Desktop threads do not prevent an otherwise safe archive delete.
 
 Cleanup checks the affected logical rows and spawn index after each success,
 and conducts **read-only** checks for remaining native rollout/version files
@@ -129,5 +138,6 @@ file-by-file deletion algorithm.
 - Unknown schemas, builds, identities, symlinks or concurrent changes fail closed.
 - The common cleanup engine does not depend on external profile managers. On macOS only, the platform adapter may request a normal quit of a provably standalone official ChatGPT app **after explicit user approval**; it never force-quits an app or a third-party-owned process. It can restore only the originally running standalone Desktop after checking that it is still safe to open. Unverified/managed sessions are left to their owner.
 - Local catalog cleanup presents the final selected-row confirmation before any optional normal-quit request. Cleanup still refuses a write while the affected profile's Desktop or app-server is active.
+- Archived Codex deletion deliberately never calls that local-catalog stop guard or Desktop restore/quit mechanism. The official app-server holds the deletion rules and thread writer-lock arbitration, while Cleanup checks exact selection and aftermath only.
 - Recovery data is private local state and is excluded from Git.
-- Tests use synthetic homes; destructive development tests never target real conversations.
+- The automated suite uses synthetic homes only. A separate, expressly user-authorized one-per-profile manual acceptance test confirmed native deletion while both signed Desktop apps remained open; no additional pre-existing conversations may be used for destructive experiments without new authorization.

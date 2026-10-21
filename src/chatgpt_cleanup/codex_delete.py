@@ -16,7 +16,7 @@ import sqlite3
 
 from .appserver import AppServerError, AppServerSession
 from .core import SafetyError, columns, database, require, safe_path, sessions
-from .platforms import PlatformAdapter, PlatformError, require_profile_stopped
+from .platforms import PlatformAdapter, PlatformError
 from .profiles import Profile
 
 
@@ -306,6 +306,20 @@ def _reference_refusal(error: AppServerError) -> bool:
     )
 
 
+def _owner_refusal(error: AppServerError) -> bool:
+    # The official app-server coordinates open threads and spawned descendants
+    # across processes. An owned writer must stay with its running application.
+    # Never release a foreign owner's lock or attempt a direct SQLite deletion.
+    if error.code != -32600:
+        return False
+    message = str(error).lower()
+    return (
+        "already has an active writer" in message
+        or "another process owns" in message
+        or "live internal worker" in message
+    )
+
+
 def execute_codex_delete_plan(
     profile: Profile,
     plan: CodexDeletePlan,
@@ -318,10 +332,10 @@ def execute_codex_delete_plan(
     A timeout, unrecognized refusal, data change or incomplete native cleanup
     stops the batch without guessing whether a destructive request completed.
     """
-    try:
-        require_profile_stopped(platform, profile)
-    except PlatformError as error:
-        raise SafetyError(str(error)) from error
+    # Intentionally do NOT require the Desktop to quit. Only the native
+    # thread/delete RPC may mutate Codex's data. That backend owns cross-
+    # process thread-writer/lifecycle locks and refuses busy threads. Direct
+    # Desktop catalog changes use an independent, still-strict stop guard.
     verified: set[str] = set()
     calls: list[str] = []
     refused: dict[str, str] = dict(plan.protected)
@@ -333,8 +347,17 @@ def execute_codex_delete_plan(
                 plan.requested_ids, rows,
                 tuple(sorted(set(edges) | set(native_edges))), states,
             )
+            selected_affected = set(plan.requested_ids) | set(plan.affected_ids)
             require(
-                current == plan,
+                (
+                    current.root_ids == plan.root_ids
+                    and current.descendants_by_root == plan.descendants_by_root
+                    and current.protected == plan.protected
+                    and all(
+                        current.rows.get(item) == plan.rows.get(item)
+                        for item in selected_affected
+                    )
+                ),
                 "Codex archived selection or spawned-thread state changed. Nothing was deleted.",
             )
             attempts = list(plan.root_ids)
@@ -364,6 +387,16 @@ def execute_codex_delete_plan(
                         ),
                         "A native spawned descendant changed. Remaining work stopped.",
                     )
+                    # A running Desktop may create a new spawned worker after
+                    # preview. Never let native cascading deletion silently
+                    # include that unapproved child.
+                    current_children, _ = _spawn_children(before_edges)
+                    require(
+                        _descendants(root, current_children)
+                        == set(plan.descendants_by_root[root]),
+                        "Spawned descendants changed during live deletion. "
+                        "Remaining work stopped.",
+                    )
                     versions, _ = _rollout_versions(profile, expected)
                     calls.append(root)
                     try:
@@ -378,6 +411,17 @@ def execute_codex_delete_plan(
                             )
                             refused[root] = "Official Codex protects referenced fork history"
                             pending.append(root)
+                            continue
+                        if _owner_refusal(error):
+                            refused_rows, refused_edges = _local_snapshot(profile)
+                            require(
+                                refused_rows == before and refused_edges == before_edges,
+                                "Native writer ownership refusal changed local state. Stopped.",
+                            )
+                            refused[root] = (
+                                "Official Codex reports a live writer or internal worker; "
+                                "leave its owning session running"
+                            )
                             continue
                         raise
                     after, after_edges = _local_snapshot(profile)
@@ -424,10 +468,6 @@ def delete_archived_codex(
     *,
     session_factory=AppServerSession,
 ) -> CodexDeleteResult:
-    try:
-        require_profile_stopped(platform, profile)
-    except PlatformError as error:
-        raise SafetyError(str(error)) from error
     plan = preview_codex_delete(
         profile, selected, platform, session_factory=session_factory,
     )

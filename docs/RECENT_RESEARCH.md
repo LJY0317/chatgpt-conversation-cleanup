@@ -56,3 +56,25 @@ contract is documented in
 [`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md),
 and the native reference rejection is implemented in
 [`thread-store/src/local/delete_thread.rs`](https://github.com/openai/codex/blob/main/codex-rs/thread-store/src/local/delete_thread.rs).
+
+### v0.4.5: Native deletion while the Desktop remains open
+
+The app-server documentation explicitly states that only one process can
+write a paginated thread at a time; when a different process owns it,
+`thread/delete` fails with JSON-RPC `-32600` rather than requiring every
+application sharing `CODEX_HOME` to be closed. The product now uses a
+profile-scoped, short-lived official app-server while Desktop remains open,
+and preserves the native writer/lifecycle protection for any busy thread.
+Only the independent **direct Desktop catalog** cleanup continues to require
+exclusive profile ownership.
+
+A bounded two-profile live acceptance experiment on macOS with the signed
+ChatGPT applications still running deleted **one explicitly authorized
+archived logical thread in each profile**, via exactly one official
+`thread/delete` call per profile. Both removals were verified against the
+state database, official list, rollout files, history projection and spawned
+edges; SQLite quick checks passed and both Desktop processes retained their
+original PIDs. Pre-existing conversation IDs, private prompts, credentials
+and personal filesystem paths are intentionally excluded from this public
+research note. This validates the observed build/profile pair, not arbitrary
+future Codex versions or the Desktop's in-memory UI cache refresh behavior.

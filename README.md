@@ -157,13 +157,29 @@ The tool never force-terminates ChatGPT or arbitrary background processes. The o
 
 Archived Codex deletion is a separate engine:
 
+**You can leave ChatGPT Desktop open.** This operation starts a short-lived
+official Codex app-server scoped to the selected profile and issues the same
+`thread/delete` requests as the official app. Native per-thread writer and
+lifecycle locks coordinate with other running Codex processes: a busy thread
+or live internal worker is left intact rather than forcing its owner to quit.
+An archived original still referenced by an active fork is likewise protected
+by Codex's own history-reference checks.
+
 1. select the exact profile and archived logical thread IDs from the local Codex inventory, including children omitted by older upstream list filters;
 2. read the official app-server's **database-only** `thread/list` inventory and the small native `thread_spawn_edges` index; protect selected roots with active, unlisted or otherwise unresolved **spawned** descendants, since official deletion cascades to those descendants;
 3. collapse selected spawned children under their eligible parent so **one official `thread/delete` request** owns the whole spawned subtree. Cleanup does not decode fork history or implement physical file deletion to decide the result;
-4. keep independent archived threads eligible when another thread is protected. A confirmed upstream `-32600` fork-history-reference refusal protects just that thread; one bounded follow-up is allowed only if other deletions succeeded and may have removed the reference. Unknown errors and uncertain transport outcomes stop immediately and are **never** automatically retried;
+4. keep independent archived threads eligible when another thread is protected. A confirmed native fork-history-reference refusal protects just that thread; an explicit native live-writer refusal also leaves its owner running. One bounded follow-up is allowed **only for history-reference refusals** and only if other deletions succeeded and may have removed the reference. Unknown errors and uncertain transport outcomes stop immediately and are **never** automatically retried;
 5. after each successful native response, verify that the expected logical threads, their native rollout versions (including compressed siblings), history projection entries, and spawn links are gone. This is **read-only auditing, not local repair**. If native deletion leaves residue, stop and report rather than manipulating OpenAI data directly.
 
 Deletion confirmation shows the maximum affected-thread count, the fewer official requests needed when subagents will cascade, and any preflight-protected roots. An active **user fork** may still reference the bytes of a protected archived original; only Codex's own reference scanner decides whether that original can be deleted. Forks are never silently deleted just because they share a parent with a selected thread.
+
+**The two menu actions deliberately differ:** the local ChatGPT catalog
+reconciliation (option 1) still requires the relevant Desktop/profile writers
+to close before its verified local database changes. The official archived
+Codex deletion (option 2) **does not close, quit, relaunch, or require closing**
+ChatGPT Desktop or separate profile runtimes. Upstream lock/conflict refusals
+are reported for those particular threads. An already-open Desktop UI may
+need a normal in-app refresh to update its cached archived list.
 
 ## Multi-profile behavior
 
@@ -177,9 +193,9 @@ Several verified profiles: one operation can target multiple profiles. Each prof
 - Native Codex history/lineage, authentication and provider tables are never rewritten directly. Archived Codex deletion delegates **all deletion and file/index cleanup** to official app-server `thread/delete`; the utility only selects, guards active spawned descendants, isolates confirmed refusals and audits native results. Log traces, cloud-side retention and files generated in project worktrees are outside the local thread-delete guarantee.
 - Direct catalog mutation requires an exact known schema and a platform/build write gate.
 - Preview changes, profile/account mismatch, unknown schemas/builds, symlinks, recovery conflicts and ambiguous request/command results stop the operation.
-- The affected ChatGPT/Codex profile data must not be in use during destructive operations. The optional live read-only scan may run while ChatGPT is open. An approved local cleanup can request a normal quit of a verified standalone official macOS app, but never forces external runtimes to stop. A supported fresh reconciliation similarly requires a brief stop while only its scheduling/scratch state is reset, then launches the verified Desktop where supported so Desktop itself performs the authenticated network reconciliation. For archived deletion, the utility starts its own short-lived official Codex app-server over stdio after the affected profile is closed and releases it by closing stdio when the operation ends.
+- **Only direct Desktop catalog writes and refresh scheduling require the affected profile to be closed.** Native archived deletion uses official per-thread writer locks and permits the affected Desktop to remain open. An approved local catalog cleanup can request a normal quit of a verified standalone official macOS app, but never forces external runtimes to stop. A supported fresh reconciliation similarly requires a brief stop while only its scheduling/scratch state is reset, then launches the verified Desktop where supported so Desktop itself performs the authenticated network reconciliation. For archived deletion, the utility starts its own short-lived official Codex app-server over stdio, scoped by `CODEX_HOME`, and releases it by closing stdio when the operation ends. If Codex refuses a busy or referenced thread, Cleanup does not bypass the protection.
 - Recovery files may contain conversation metadata and are stored privately outside the repository.
-- Tests use synthetic homes only. Real user conversations are not deleted for testing.
+- Automated tests use synthetic homes only. Separately authorized, explicitly bounded manual live acceptance experiments may exercise real profiles; they are never run by the automated suite, and no further existing personal conversations are eligible without fresh user approval.
 
 ## Remove the program
 
