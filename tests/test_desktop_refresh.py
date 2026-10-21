@@ -1,31 +1,24 @@
-import contextlib
-import io
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from chatgpt_cleanup import core
 from chatgpt_cleanup.core import SafetyError
-from chatgpt_cleanup.__main__ import (
-    _desktop_refresh_offer,
-    _maybe_refresh_desktop_assessments,
-    _wait_for_desktop_refresh,
-)
 from chatgpt_cleanup.desktop_refresh import (
     DesktopCatalogRefreshProgress,
     DesktopCatalogRefreshRequest,
     DesktopCatalogRefreshResult,
+    _host_token,
+    _workspace_host,
+    _workspace_hosts,
     desktop_catalog_refresh_progress,
     desktop_catalog_refresh_result,
     prepare_desktop_catalog_refresh,
-    recent_full_reconciliation_age_seconds,
 )
 from chatgpt_cleanup.platforms import PlatformError
 from chatgpt_cleanup.profiles import Profile, ProfileIdentity
-from chatgpt_cleanup.reconcile import CatalogAssessment, ReconcileStatus
-
 
 class RefreshPlatform:
     key = "test"
@@ -47,6 +40,8 @@ class RefreshPlatform:
     def require_desktop_stopped(self):
         if self.running:
             raise PlatformError("Desktop is running")
+
+
 
 
 class DesktopRefreshTests(unittest.TestCase):
@@ -349,88 +344,6 @@ class DesktopRefreshTests(unittest.TestCase):
         self.assertEqual(result.completed_at_ms, 1100)
         self.assertEqual(result.observation_sequence, 25)
 
-
-    def test_interactive_refresh_reclassifies_only_fresh_current_host_evidence(self):
-        self.add_row("present", missing=0, sequence=1)
-        self.add_row("missing", missing=1, sequence=25)
-        self.add_row("protected", missing=1, sequence=25)
-        profile = Profile(
-            "default",
-            "ChatGPT",
-            self.root,
-            "official",
-            identity=ProfileIdentity(workspace_account_id="account-one"),
-        )
-        rows = core.chatgpt_catalog(profile)
-        assessments = []
-        for row in rows:
-            status = (
-                ReconcileStatus.PROTECTED
-                if row["thread_id"] == "protected"
-                else ReconcileStatus.UNKNOWN
-            )
-            assessments.append(CatalogAssessment(row, status, "fixture"))
-
-        request = DesktopCatalogRefreshRequest(
-            profile_id="default",
-            host_id=self.host,
-            requested_at_ms=1000,
-            starting_observation_sequence=20,
-            previous_last_full_reconciled_at=900,
-        )
-        prepare_calls = []
-
-        def prepare(received_profile, account_id, platform):
-            prepare_calls.append((received_profile.id, account_id))
-            return request
-
-        def result(received_profile, received_request, platform):
-            self.assertEqual(received_request, request)
-            return DesktopCatalogRefreshResult(
-                host_id=self.host,
-                completed_at_ms=1100,
-                observation_sequence=25,
-                present_ids=frozenset({"present"}),
-                missing_ids=frozenset({"missing", "protected"}),
-            )
-
-        with (
-            patch("builtins.input", side_effect=["", ""]),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            updated = _maybe_refresh_desktop_assessments(
-                profile,
-                assessments,
-                self.platform,
-                refresh_prepare=prepare,
-                refresh_result=result,
-            )
-        by_id = {item.row["thread_id"]: item.status for item in updated}
-        self.assertEqual(prepare_calls, [("default", "account-one")])
-        self.assertEqual(by_id["present"], ReconcileStatus.PRESENT)
-        self.assertEqual(by_id["missing"], ReconcileStatus.CONFIRMED)
-        self.assertEqual(by_id["protected"], ReconcileStatus.PROTECTED)
-
-    def test_plura_confirmed_leftovers_are_offered_desktop_owned_refresh_first(self):
-        self.add_row("confirmed", missing=0, sequence=1)
-        profile = Profile(
-            "profile2",
-            "Profile 2",
-            self.root,
-            "plura-desktop",
-            identity=ProfileIdentity(workspace_account_id="account-one"),
-        )
-        row = core.chatgpt_catalog(profile)[0]
-        assessments = [
-            CatalogAssessment(
-                row=row,
-                status=ReconcileStatus.CONFIRMED,
-                reason="fixture",
-            )
-        ]
-        offer = _desktop_refresh_offer(profile, assessments, self.platform)
-        self.assertEqual(offer, ("account-one", self.host, 1))
-
     def test_result_rejects_old_full_timestamp_even_if_sequence_advanced(self):
         request = DesktopCatalogRefreshRequest(
             profile_id="default",
@@ -500,59 +413,53 @@ class DesktopRefreshTests(unittest.TestCase):
         progress = desktop_catalog_refresh_progress(self.profile, request)
         self.assertEqual(progress.stage, "complete")
 
-    def test_recent_full_reconciliation_age_is_read_without_mutation(self):
-        self.assertEqual(
-            recent_full_reconciliation_age_seconds(
-                self.profile,
-                self.host,
-                now_ms=10_900,
-            ),
-            10.0,
-        )
-
-    def test_automatic_wait_returns_result_without_manual_check_prompt(self):
-        request = DesktopCatalogRefreshRequest(
-            profile_id="default",
-            host_id=self.host,
-            requested_at_ms=1000,
-            starting_observation_sequence=20,
-            previous_last_full_reconciled_at=900,
-        )
-        expected = DesktopCatalogRefreshResult(
-            host_id=self.host,
-            completed_at_ms=1100,
-            observation_sequence=22,
-            present_ids=frozenset({"present"}),
-            missing_ids=frozenset(),
-        )
-        results = iter([None, None, expected])
-        progress = DesktopCatalogRefreshProgress(
-            stage="full",
-            observation_sequence=21,
-            completed_at_ms=None,
-            mode="full",
-            phase="head",
-            seen_entries=3,
-            catalog_rows=4,
-            missing_candidates=0,
-        )
-        clock = iter([0.0, 1.0, 2.0, 3.0])
-        slept = []
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = _wait_for_desktop_refresh(
-                self.profile,
-                request,
-                self.platform,
-                refresh_result=lambda *args: next(results),
-                progress_reader=lambda *args: progress,
-                monotonic=lambda: next(clock),
-                sleep=lambda value: slept.append(value),
-                poll_seconds=0.25,
-                idle_timeout_seconds=30,
-                total_timeout_seconds=60,
+    def test_same_account_host_token_scopes_refresh_and_preserves_catalog_rows(self):
+        """One ChatGPT account may have two local Desktop hosts."""
+        second = "chatgpt:account-one:another-user-host"
+        self.add_row("original-chat")
+        db = sqlite3.connect(self.db_path)
+        with db:
+            db.execute(
+                "INSERT INTO local_thread_catalog_hosts VALUES(?,'chatgpt')",
+                (second,),
             )
-        self.assertEqual(result, expected)
-        self.assertEqual(slept, [0.25, 0.25])
+            db.execute(
+                "INSERT INTO local_thread_catalog_sync_state VALUES(?,100,1,18,850)",
+                (second,),
+            )
+            db.execute(
+                "INSERT INTO local_thread_catalog "
+                "(host_id,thread_id,source_kind,missing_candidate) "
+                "VALUES(?,'second-chat','chatgpt',0)",
+                (second,),
+            )
+        db.close()
+
+        with self.assertRaisesRegex(SafetyError, "exactly one"):
+            prepare_desktop_catalog_refresh(
+                self.profile, "account-one", self.platform,
+            )
+        request = prepare_desktop_catalog_refresh(
+            self.profile, "account-one", self.platform,
+            host_token=_host_token(second),
+        )
+        self.assertEqual(request.host_id, second)
+        db = sqlite3.connect(self.db_path)
+        try:
+            state = dict(db.execute(
+                "SELECT host_id,last_full_reconciled_at FROM "
+                "local_thread_catalog_sync_state",
+            ))
+            ids = {
+                row[0] for row in db.execute(
+                    "SELECT thread_id FROM local_thread_catalog",
+                )
+            }
+        finally:
+            db.close()
+        self.assertEqual(state[self.host], 900)
+        self.assertIsNone(state[second])
+        self.assertEqual(ids, {"original-chat", "second-chat"})
 
 
 if __name__ == "__main__":

@@ -300,10 +300,11 @@ class MacOSAdapter(PlatformAdapter):
         return None
 
     def catalog_write_gate(self) -> tuple[bool, str]:
-        # Direct catalog writes stay build-gated even when the SQLite schema matches.
+        # Only native Desktop sync scheduling writes remain, never conversation deletion.
         verified = {
             ("26.915.31945", "9922"),
             ("26.924.22138", "11645"),
+            ("26.1016.51333", "21161"),
         }
         current = self.app_build()
         if current in verified:
@@ -315,7 +316,10 @@ class MacOSAdapter(PlatformAdapter):
     def catalog_refresh_gate(self) -> tuple[bool, str]:
         # The refresh contract depends on internal Desktop sync semantics, so it
         # stays narrower than the ordinary catalog-write gate.
-        verified = {("26.924.22138", "11645")}
+        verified = {
+            ("26.924.22138", "11645"),
+            ("26.1016.51333", "21161"),
+        }
         current = self.app_build()
         if current in verified:
             return True, f"refresh-verified ChatGPT build {current[0]} ({current[1]})"
@@ -365,7 +369,10 @@ class MacOSAdapter(PlatformAdapter):
         short = info.get("CFBundleShortVersionString")
         build = info.get("CFBundleVersion")
         current = (short, build) if isinstance(short, str) and isinstance(build, str) else None
-        verified = {("26.924.22138", "11645")}
+        verified = {
+            ("26.924.22138", "11645"),
+            ("26.1016.51333", "21161"),
+        }
         if current in verified:
             return True, f"refresh-verified Plura ChatGPT build {short} ({build})"
         if current is None:

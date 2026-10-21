@@ -8,7 +8,6 @@ The storage write guards remain authoritative even after the app exits.
 import subprocess
 import time
 
-from .diagnostics import record_blocked_check
 from .platforms import PlatformError, require_profile_stopped
 
 
@@ -30,9 +29,6 @@ def wait_for_desktop_to_close(
                 platform.require_desktop_stopped()
             return True
         except PlatformError as error:
-            record_blocked_check(
-                platform, operation=purpose, profiles=targets, error=error
-            )
             if first:
                 stage = (
                     "a fresh Desktop reconciliation can be queued"

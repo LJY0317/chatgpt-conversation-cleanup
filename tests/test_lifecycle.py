@@ -1,5 +1,4 @@
-"""Lifecycle invariants tested without launching Desktop or deleting chats."""
-
+"""Normal Desktop lifecycle safety, entirely synthetic."""
 import contextlib
 import io
 from pathlib import Path
@@ -7,15 +6,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from chatgpt_cleanup.__main__ import _apply_batch_selected, apply_batch
-from chatgpt_cleanup.diagnostics import record_blocked_check
 from chatgpt_cleanup.lifecycle import (
     restore_initial_desktops,
     wait_for_desktop_to_close,
 )
 from chatgpt_cleanup.platforms import PlatformError
 from chatgpt_cleanup.profiles import Profile
-
 
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
@@ -129,88 +125,6 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(platform.requests, 1)
         self.assertGreaterEqual(clock[0], 8)
 
-    def test_cancelled_confirmation_does_not_close_any_app(self):
-        selected = [(self.profile, [{"thread_id": "synthetic"}])]
-        order = []
-
-        def summary(*args, **kwargs):
-            order.append("confirm")
-            return False
-
-        with (
-            patch("chatgpt_cleanup.__main__._collect_work", return_value=selected),
-            patch("chatgpt_cleanup.__main__._batch_summary", side_effect=summary),
-            patch("chatgpt_cleanup.__main__._wait_for_desktop_to_close") as wait,
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            _apply_batch_selected("catalog", [self.profile], object())
-        self.assertEqual(order, ["confirm"])
-        wait.assert_not_called()
-
-    def test_approved_selection_reaches_close_gate_only_after_confirmation(self):
-        selected = [(self.profile, [{"thread_id": "synthetic"}])]
-        order = []
-
-        def summary(*args, **kwargs):
-            order.append("confirm")
-            return True
-
-        def stop_gate(*args, **kwargs):
-            order.append("stop")
-            self.assertTrue(kwargs["approved_normal_quit"])
-            return False
-
-        with (
-            patch("chatgpt_cleanup.__main__._collect_work", return_value=selected),
-            patch("chatgpt_cleanup.__main__._batch_summary", side_effect=summary),
-            patch("chatgpt_cleanup.__main__._wait_for_desktop_to_close", side_effect=stop_gate),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            _apply_batch_selected("catalog", [self.profile], object())
-        self.assertEqual(order, ["confirm", "stop"])
-
-    def test_archived_delete_keeps_desktop_open_and_never_calls_quit_guard(self):
-        selected = [(self.profile, [{"id": "synthetic", "archived": 1}])]
-
-        class FakePlan:
-            root_ids = ("synthetic",)
-            protected = {}
-            affected_ids = frozenset({"synthetic"})
-            dependent_ids = ()
-
-        class FakeResult:
-            deleted_ids = ("synthetic",)
-            native_calls = ("synthetic",)
-            protected = {}
-
-        class Platform:
-            home = self.home
-            data_root = self.home / "app-data"
-            recovery_root = self.home / "app-data" / "recovery"
-
-            def require_profile_desktop_stopped(self, profile):
-                raise AssertionError("The running Desktop must not be closed for native RPC.")
-
-            def desktop_restore_plan(self, profiles):
-                raise AssertionError("No Desktop restoration is needed for native RPC.")
-
-        with (
-            patch("chatgpt_cleanup.__main__._collect_work", return_value=selected),
-            patch("chatgpt_cleanup.__main__._batch_summary", return_value=True),
-            patch("chatgpt_cleanup.__main__._wait_for_desktop_to_close") as close,
-            patch("chatgpt_cleanup.__main__.capture_initial_desktops") as capture,
-            patch("chatgpt_cleanup.__main__.restore_initial_desktops") as restore,
-            patch("chatgpt_cleanup.__main__.preview_codex_delete", return_value=FakePlan()),
-            patch("chatgpt_cleanup.__main__.execute_codex_delete_plan", return_value=FakeResult()) as native,
-            patch("chatgpt_cleanup.__main__.operation_lock", return_value=contextlib.nullcontext()),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            apply_batch("delete", [self.profile], Platform())
-        close.assert_not_called()
-        capture.assert_not_called()
-        restore.assert_not_called()
-        native.assert_called_once()
-
     def test_previously_closed_profile_is_not_launched(self):
         class Platform:
             def desktop_restore_plan(self, profiles):
@@ -252,20 +166,6 @@ class LifecycleTests(unittest.TestCase):
             )
         self.assertIn("data is still in use", output.getvalue())
 
-    def test_blocked_check_log_refuses_symlink_targets(self):
-        class Platform:
-            data_root = self.home / "data"
-
-        diagnostics = Platform.data_root / "diagnostics"
-        diagnostics.mkdir(parents=True)
-        private_target = self.home / "user-document"
-        private_target.write_text("KEEP THIS TEXT")
-        (diagnostics / "desktop-stop.jsonl").symlink_to(private_target)
-        record_blocked_check(
-            Platform(), operation="cleanup", profiles=[self.profile],
-            error=PlatformError("private detail", process_kind="chatgpt", pid=123),
-        )
-        self.assertEqual(private_target.read_text(), "KEEP THIS TEXT")
 
 
 if __name__ == "__main__":

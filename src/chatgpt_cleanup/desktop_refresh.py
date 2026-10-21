@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import time
 
@@ -37,29 +38,6 @@ class DesktopCatalogRefreshProgress:
     seen_entries: int
     catalog_rows: int
     missing_candidates: int
-
-
-def recent_full_reconciliation_age_seconds(
-    profile: Profile,
-    host_id: str,
-    *,
-    now_ms: int | None = None,
-) -> float | None:
-    path = profile.root / "sqlite/codex-dev.db"
-    with database(path, profile.root) as db:
-        write_schema(db)
-        row = db.execute(
-            "SELECT last_full_reconciled_at FROM local_thread_catalog_sync_state "
-            "WHERE host_id=?",
-            (host_id,),
-        ).fetchone()
-    if row is None or not isinstance(row["last_full_reconciled_at"], int):
-        return None
-    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
-    age_ms = current_ms - row["last_full_reconciled_at"]
-    if age_ms < 0:
-        return 0.0
-    return age_ms / 1000.0
 
 
 def desktop_catalog_refresh_progress(
@@ -149,7 +127,12 @@ def _require_profile_stopped(profile: Profile, platform: PlatformAdapter) -> Non
     require_profile_stopped(platform, profile)
 
 
-def _workspace_host(db, account_id: str) -> str:
+def _host_token(host_id: str) -> str:
+    """Opaque, stable local selector; do not expose account/user identifiers."""
+    return hashlib.sha256(host_id.encode("utf-8")).hexdigest()[:12]
+
+
+def _workspace_hosts(db, account_id: str) -> list[str]:
     hosts = []
     for row in db.execute(
         "SELECT host_id FROM local_thread_catalog_hosts WHERE host_kind='chatgpt'"
@@ -160,9 +143,17 @@ def _workspace_host(db, account_id: str) -> str:
         parts = host_id.split(":", 2)
         if len(parts) == 3 and parts[0] == "chatgpt" and parts[1] == account_id:
             hosts.append(host_id)
+    return sorted(set(hosts))
+
+
+def _workspace_host(db, account_id: str, *, host_token: str | None = None) -> str:
+    hosts = _workspace_hosts(db, account_id)
+    if host_token is not None:
+        hosts = [host_id for host_id in hosts if _host_token(host_id) == host_token]
     require(
         len(hosts) == 1,
-        "Could not identify exactly one local ChatGPT catalog for the signed-in workspace.",
+        "Could not select exactly one ChatGPT catalog host. "
+        "Use a unique --host-token from the read-only repair preview.",
     )
     return hosts[0]
 
@@ -171,6 +162,8 @@ def prepare_desktop_catalog_refresh(
     profile: Profile,
     account_id: str,
     platform: PlatformAdapter,
+    *,
+    host_token: str | None = None,
 ) -> DesktopCatalogRefreshRequest:
     """Queue one Desktop-owned full ChatGPT catalog reconciliation.
 
@@ -193,7 +186,7 @@ def prepare_desktop_catalog_refresh(
             # process/SQLite race: if Desktop appeared after the outer check,
             # the scheduling-state mutation is rolled back instead of racing it.
             _require_profile_stopped(profile, platform)
-            host_id = _workspace_host(db, account_id)
+            host_id = _workspace_host(db, account_id, host_token=host_token)
             state = db.execute(
                 "SELECT observation_sequence,last_full_reconciled_at "
                 "FROM local_thread_catalog_sync_state WHERE host_id=?",
