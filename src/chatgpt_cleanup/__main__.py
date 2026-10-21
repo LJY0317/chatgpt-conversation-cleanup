@@ -270,11 +270,17 @@ def _batch_summary(action, work, *, delete_plans=None):
         used_profiles += 1
         if action == "delete" and delete_plans is not None:
             plan = delete_plans[profile.id]
-            count = len(plan.ordered_ids)
+            count = len(plan.affected_ids)
             dependent = len(plan.dependent_ids)
             total += count
-            suffix = f" (+{dependent} dependent archived fork(s))" if dependent else ""
-            print(f"{profile.display_name}: {count}{suffix}")
+            print(
+                f"{profile.display_name}: up to {count} archived chat(s) "
+                f"through {len(plan.root_ids)} official delete request(s)"
+            )
+            if dependent:
+                print(f"  {dependent} hidden spawned descendant(s) included by Codex")
+            if plan.protected:
+                print(f"  {len(plan.protected)} selected parent(s) protected by active descendants")
         else:
             total += len(rows)
             manual = sum(row.get("classification") == "manual-local-cleanup" for row in rows)
@@ -282,10 +288,13 @@ def _batch_summary(action, work, *, delete_plans=None):
             print(f"{profile.display_name}: {len(rows)}{suffix}")
     if action == "delete":
         print(
-            "\nThese archived Codex chats will be permanently deleted through the "
-            "official Codex app-server. Dependent archived forks are deleted before "
-            "their parents. This cannot be undone."
+            "\nThe official Codex app-server performs deletion and its own spawned "
+            "descendant/file/index cleanup. This tool does not delete Codex files "
+            "directly. Protected fork histories are preserved. This cannot be undone."
         )
+        if not total:
+            print("No safely selectable native deletions remain. Nothing was changed.")
+            return False
         phrase = f"DELETE {total} CHATS"
     else:
         print(
@@ -1072,8 +1081,15 @@ def _apply_batch_selected(
             try:
                 if action == "delete":
                     plan = delete_plans[profile.id]
-                    execute_codex_delete_plan(profile, plan, platform)
-                    detail = f"{len(plan.ordered_ids)} archived Codex chat(s) permanently deleted"
+                    result = execute_codex_delete_plan(profile, plan, platform)
+                    detail = (
+                        f"{len(result.deleted_ids)} archived Codex chat(s) verified deleted "
+                        f"by {len(result.native_calls)} official request(s)"
+                    )
+                    if result.protected:
+                        print(f"  {len(result.protected)} archived chat(s) remain protected:")
+                        for thread_id, reason in result.protected.items():
+                            print(f"    {thread_id[:13]}... — {reason}")
                 else:
                     backup = evict_catalog(
                         profile,

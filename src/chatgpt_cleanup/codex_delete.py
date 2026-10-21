@@ -1,100 +1,65 @@
+"""A thin, owner-verified client for Codex's own permanent thread deletion.
+
+Only the bundled app-server deletes conversations, spawned agents, rollout
+files, and indexes. This module selects roots, protects active spawned workers,
+isolates definitive fork-reference refusals, and verifies the native result.
+It never implements Codex's rollout dependency or deletion algorithms.
+"""
+
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
-import json
 from pathlib import Path
+import re
+import sqlite3
 
 from .appserver import AppServerError, AppServerSession
-from .core import SafetyError, require, safe_path, sessions
+from .core import SafetyError, columns, database, require, safe_path, sessions
 from .platforms import PlatformAdapter, PlatformError, require_profile_stopped
 from .profiles import Profile
+
+
+_ROLLOUT_NAME = re.compile(
+    r"^rollout-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-"
+    r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})"
+    r"(?:_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))?"
+    r"\.jsonl(?:\.zst)?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
 class CodexDeletePlan:
     requested_ids: tuple[str, ...]
-    ordered_ids: tuple[str, ...]
+    root_ids: tuple[str, ...]
+    descendants_by_root: dict[str, frozenset[str]]
+    protected: dict[str, str]
     rows: dict[str, dict]
-    parents: dict[str, frozenset[str]]
+    spawn_edges: tuple[tuple[str, str, str], ...]
+    official_states: dict[str, bool]
+
+    @property
+    def affected_ids(self) -> frozenset[str]:
+        result = set(self.root_ids)
+        for descendants in self.descendants_by_root.values():
+            result.update(descendants)
+        return frozenset(result)
 
     @property
     def dependent_ids(self) -> tuple[str, ...]:
-        requested = set(self.requested_ids)
-        return tuple(thread_id for thread_id in self.ordered_ids if thread_id not in requested)
+        return tuple(sorted(self.affected_ids - set(self.requested_ids)))
 
 
-def _rollout_parent_ids(profile: Profile, row: dict) -> set[str]:
-    raw_path = row.get("rollout_path")
-    if not isinstance(raw_path, str) or not raw_path:
-        return set()
-    path = verified_rollout_path(profile, row)
-    try:
-        # Inspect the bounded session_meta header. Codex may replace an
-        # archived .jsonl file with .jsonl.zst without rewriting rollout_path.
-        # Never unpack into the official profile or modify its database.
-        if path.suffix == ".zst":
-            try:
-                from compression import zstd  # Python 3.14+
-            except ImportError:
-                try:
-                    import zstandard as zstd  # Python 3.11-3.13
-                except ImportError as error:
-                    raise SafetyError(
-                        "A Zstandard decoder is required for compressed Codex rollouts. "
-                        "Dependency planning stopped."
-                    ) from error
-            stream = zstd.open(path, "rt", encoding="utf-8")
-        else:
-            stream = path.open("r", encoding="utf-8")
-        with stream:
-            first = stream.readline(256 * 1024 + 1)
-        require(
-            len(first) <= 256 * 1024,
-            "A Codex rollout header exceeded the safety limit. Dependency planning stopped.",
-        )
-        record = json.loads(first)
-    except Exception as error:
-        if isinstance(error, SafetyError):
-            raise
-        # compression.zstd.ZstdError is not an OSError subclass. Treat a
-        # corrupt or truncated compressed header as a safe planning failure.
-        raise SafetyError(
-            "A Codex rollout header could not be read. Dependency planning stopped."
-        ) from error
-    require(
-        isinstance(record, dict) and record.get("type") == "session_meta",
-        "A Codex rollout has no readable session metadata. Dependency planning stopped.",
-    )
-    payload = record.get("payload")
-    require(
-        isinstance(payload, dict),
-        "A Codex rollout has invalid session metadata. Dependency planning stopped.",
-    )
-    require(
-        payload.get("id") == row.get("id"),
-        "A Codex rollout does not belong to the selected thread. Dependency planning stopped.",
-    )
-    parents: set[str] = set()
-    forked = payload.get("forked_from_id")
-    if isinstance(forked, str) and forked:
-        parents.add(forked)
-    history_base = payload.get("history_base")
-    if isinstance(history_base, dict):
-        parent = history_base.get("thread_id")
-        # Paginated/reverted rollouts may reference a prior rollout of the
-        # same logical thread. That history version is internal to the thread,
-        # not a distinct dependent conversation to delete or a graph cycle.
-        if isinstance(parent, str) and parent and parent != row.get("id"):
-            parents.add(parent)
-    return parents
+@dataclass(frozen=True)
+class CodexDeleteResult:
+    deleted_ids: tuple[str, ...]
+    native_calls: tuple[str, ...]
+    protected: dict[str, str]
 
 
 def verified_rollout_path(profile: Profile, row: dict) -> Path:
-    """Resolve only the exact owned rollout path or its .jsonl.zst replacement.
-
-    No UUID scan, profile mutation or database repair occurs here. Unsafe and
-    missing paths are rejected before dependency planning can delete anything.
-    """
+    """Read-only diagnostic for a stored path or its exact .jsonl.zst sibling."""
     raw_path = row.get("rollout_path")
     require(isinstance(raw_path, str) and bool(raw_path), "A Codex rollout path is missing.")
     try:
@@ -107,129 +72,163 @@ def verified_rollout_path(profile: Profile, row: dict) -> Path:
                 return compressed
     except (SafetyError, OSError) as error:
         raise SafetyError(
-            "A Codex rollout path could not be verified. Dependency planning stopped."
+            "A Codex rollout path could not be verified. No changes were made."
         ) from error
-    raise SafetyError(
-        "A Codex rollout path could not be verified. Dependency planning stopped."
-    )
+    raise SafetyError("A Codex rollout path could not be verified. No changes were made.")
 
 
-def _list_appserver_threads(session: AppServerSession) -> list[dict]:
-    rows: list[dict] = []
+def _local_snapshot(profile: Profile) -> tuple[dict[str, dict], tuple[tuple[str, str, str], ...]]:
+    rows = {row["id"]: row for row in sessions(profile)}
+    with database(profile.root / "state_5.sqlite", profile.root) as db:
+        require(
+            {"parent_thread_id", "child_thread_id", "status"}
+            <= columns(db, "thread_spawn_edges"),
+            "Unsupported Codex spawned-thread index. No changes were made.",
+        )
+        edges = tuple(
+            sorted(
+                (str(row["parent_thread_id"]), str(row["child_thread_id"]), str(row["status"]))
+                for row in db.execute(
+                    "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges"
+                )
+            )
+        )
+    return rows, edges
+
+
+def _official_inventory(
+    server: AppServerSession,
+) -> tuple[dict[str, bool], tuple[tuple[str, str, str], ...]]:
+    """Read an independent native inventory without scan-and-repair writes.
+
+    Some upstream builds omit empty-preview archived children. Local state is
+    therefore also needed for user-visible selection, but a positive native
+    'active' result remains a veto.
+    """
+    result: dict[str, bool] = {}
+    native_spawn_edges: set[tuple[str, str, str]] = set()
     for archived in (False, True):
-        cursor = None
-        seen_cursors: set[str] = set()
-        pages = 0
-        while True:
-            require(pages < 1000, "Official Codex thread listing exceeded the safety page limit.")
-            page = session.list_threads(
+        cursor: str | None = None
+        seen: set[str] = set()
+        for _ in range(1000):
+            response = server.list_threads(
                 archived=archived,
                 cursor=cursor,
                 include_derived=True,
-                use_state_db_only=False,
+                use_state_db_only=True,
             )
-            data = page.get("data")
-            require(isinstance(data, list), "Official Codex thread list returned an unexpected response.")
-            for item in data:
-                if isinstance(item, dict) and isinstance(item.get("id"), str):
-                    row = dict(item)
-                    row["_listed_archived"] = archived
-                    rows.append(row)
-            next_cursor = page.get("nextCursor")
-            if not isinstance(next_cursor, str) or not next_cursor:
+            data = response.get("data")
+            require(isinstance(data, list), "Official Codex returned an invalid thread list.")
+            for entry in data:
+                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                    continue
+                thread_id = entry["id"]
+                require(
+                    thread_id not in result or result[thread_id] == archived,
+                    "Official Codex reported conflicting archived states. No changes were made.",
+                )
+                result[thread_id] = archived
+                native_parent = entry.get("parentThreadId")
+                if isinstance(native_parent, str) and native_parent:
+                    native_spawn_edges.add((native_parent, thread_id, "native"))
+            cursor = response.get("nextCursor")
+            if not cursor:
                 break
-            require(next_cursor not in seen_cursors, "Official Codex thread pagination repeated a cursor.")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-            pages += 1
-    return rows
-
-
-def _dependency_map(
-    profile: Profile,
-    db_rows: dict[str, dict],
-    app_rows: list[dict],
-) -> tuple[dict[str, frozenset[str]], dict[str, bool]]:
-    parents: dict[str, set[str]] = {
-        thread_id: _rollout_parent_ids(profile, row)
-        for thread_id, row in db_rows.items()
-    }
-    app_archived: dict[str, bool] = {}
-    for item in app_rows:
-        thread_id = item.get("id")
-        if not isinstance(thread_id, str) or not thread_id:
-            continue
-        listed_archived = item.get("_listed_archived")
-        if isinstance(listed_archived, bool):
-            previous = app_archived.get(thread_id)
             require(
-                previous is None or previous == listed_archived,
-                "Official Codex inventory listed one thread as both active and archived.",
+                isinstance(cursor, str) and cursor not in seen,
+                "Official Codex repeated a listing cursor. No changes were made.",
             )
-            app_archived[thread_id] = listed_archived
-        target = parents.setdefault(thread_id, set())
-        for key in ("parentThreadId", "forkedFromId"):
-            parent = item.get(key)
-            if isinstance(parent, str) and parent:
-                target.add(parent)
-    return (
-        {thread_id: frozenset(value) for thread_id, value in parents.items()},
-        app_archived,
-    )
+            seen.add(cursor)
+        else:
+            raise SafetyError("Official Codex listing exceeded the page limit.")
+    return result, tuple(sorted(native_spawn_edges))
 
 
-def _closure_and_order(
-    selected_ids: set[str],
-    db_rows: dict[str, dict],
-    parents: dict[str, frozenset[str]],
-    app_archived: dict[str, bool],
-) -> tuple[set[str], list[str]]:
-    closure = set(selected_ids)
-    changed = True
-    while changed:
-        changed = False
-        for child, parent_ids in parents.items():
-            if child in closure or not (parent_ids & closure):
+def _spawn_children(
+    edges: tuple[tuple[str, str, str], ...],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    children: dict[str, set[str]] = defaultdict(set)
+    parents: dict[str, set[str]] = defaultdict(set)
+    for parent, child, _status in edges:
+        children[parent].add(child)
+        parents[child].add(parent)
+    return children, parents
+
+
+def _descendants(start: str, children: dict[str, set[str]]) -> set[str]:
+    found: set[str] = set()
+    waiting = list(children.get(start, ()))
+    while waiting:
+        thread_id = waiting.pop()
+        require(
+            thread_id != start,
+            "Codex reported a spawned-thread cycle. No changes were made.",
+        )
+        if thread_id in found:
+            continue
+        found.add(thread_id)
+        waiting.extend(children.get(thread_id, ()))
+    return found
+
+
+def _build_plan(
+    requested: tuple[str, ...],
+    rows: dict[str, dict],
+    edges: tuple[tuple[str, str, str], ...],
+    states: dict[str, bool],
+) -> CodexDeletePlan:
+    children, parents = _spawn_children(edges)
+    protected: dict[str, str] = {}
+    for thread_id in requested:
+        row = rows.get(thread_id)
+        require(
+            row is not None and row.get("archived") == 1,
+            "A selected archived thread changed. No changes were made.",
+        )
+        if states.get(thread_id) is False:
+            protected[thread_id] = "Native Codex lists this thread as active"
+            continue
+        spawned = _descendants(thread_id, children)
+        if any(
+            child not in rows
+            or rows[child].get("archived") != 1
+            or states.get(child) is False
+            for child in spawned
+        ):
+            protected[thread_id] = "An active or unknown spawned descendant must be preserved"
+
+    eligible = set(requested) - set(protected)
+    # Calling native delete on an eligible root already deletes its spawned
+    # descendants. Do not issue duplicate deletes for explicitly selected
+    # children. A child of a protected root can still be an independent root.
+    roots: list[str] = []
+    for thread_id in requested:
+        if thread_id not in eligible:
+            continue
+        pending = list(parents.get(thread_id, ()))
+        ancestors: set[str] = set()
+        while pending:
+            parent = pending.pop()
+            if parent in ancestors:
                 continue
-            row = db_rows.get(child)
-            if row is None:
-                raise SafetyError(
-                    "The official Codex inventory reports a dependent child/fork "
-                    "that is missing from the local database snapshot. Nothing was deleted."
-                )
-            if row.get("archived") != 1 or app_archived.get(child) is False:
-                raise SafetyError(
-                    "An active Codex child/fork still depends on a selected archived chat. "
-                    "Archive or detach that child before deleting its parent."
-                )
-            closure.add(child)
-            changed = True
+            ancestors.add(parent)
+            pending.extend(parents.get(parent, ()))
+        require(thread_id not in ancestors, "Codex spawned-thread cycle detected.")
+        if not ancestors.intersection(eligible):
+            roots.append(thread_id)
 
-    children: dict[str, set[str]] = {thread_id: set() for thread_id in closure}
-    for child in closure:
-        for parent in parents.get(child, frozenset()):
-            if parent in closure:
-                children.setdefault(parent, set()).add(child)
-
-    ordered: list[str] = []
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(thread_id: str):
-        if thread_id in visited:
-            return
-        if thread_id in visiting:
-            raise SafetyError("A Codex thread dependency cycle was detected. Nothing was deleted.")
-        visiting.add(thread_id)
-        for child in sorted(children.get(thread_id, set())):
-            visit(child)
-        visiting.remove(thread_id)
-        visited.add(thread_id)
-        ordered.append(thread_id)
-
-    for thread_id in sorted(closure):
-        visit(thread_id)
-    return closure, ordered
+    spawned_by_root = {
+        root: frozenset(_descendants(root, children)) for root in roots
+    }
+    return CodexDeletePlan(
+        requested_ids=requested,
+        root_ids=tuple(roots),
+        descendants_by_root=spawned_by_root,
+        protected=protected,
+        rows=rows,
+        spawn_edges=edges,
+        official_states=states,
+    )
 
 
 def preview_codex_delete(
@@ -240,35 +239,181 @@ def preview_codex_delete(
     session_factory=AppServerSession,
 ) -> CodexDeletePlan:
     require(selected, "No archived Codex chats were selected.")
-    requested_ids = [row.get("id") for row in selected]
-    require(all(isinstance(item, str) and item for item in requested_ids), "A selected Codex chat has no valid ID.")
-    require(len(set(requested_ids)) == len(requested_ids), "Duplicate Codex delete targets are not allowed.")
-    require(all(row.get("archived") == 1 for row in selected), "Only archived Codex chats can be permanently deleted here.")
-
-    current_rows = {row["id"]: row for row in sessions(profile)}
-    for selected_row in selected:
-        current = current_rows.get(selected_row["id"])
-        require(current == selected_row, "A selected Codex chat changed after preview. Review it again.")
-
+    requested = tuple(row.get("id") for row in selected)
+    require(
+        all(isinstance(thread_id, str) and thread_id for thread_id in requested)
+        and len(set(requested)) == len(requested),
+        "Each selected Codex thread must have a unique ID.",
+    )
+    rows, edges = _local_snapshot(profile)
+    for chosen in selected:
+        require(
+            chosen.get("archived") == 1 and rows.get(chosen["id"]) == chosen,
+            "A selected Codex chat changed after review. No changes were made.",
+        )
     try:
-        with session_factory(profile, platform, timeout=15) as appserver:
-            app_rows = _list_appserver_threads(appserver)
+        with session_factory(profile, platform, timeout=15) as server:
+            states, native_edges = _official_inventory(server)
     except (PlatformError, AppServerError) as error:
         raise SafetyError(str(error)) from error
+    return _build_plan(requested, rows, tuple(sorted(set(edges) | set(native_edges))), states)
 
-    parents, app_archived = _dependency_map(profile, current_rows, app_rows)
-    closure, ordered = _closure_and_order(
-        set(requested_ids),
-        current_rows,
-        parents,
-        app_archived,
+
+def _rollout_versions(profile: Profile, logical_ids: set[str]) -> tuple[set[str], set[Path]]:
+    """Read-only native-artifact evidence, never a list of files to delete."""
+    versions: set[str] = set()
+    paths: set[Path] = set()
+    for directory in ("sessions", "archived_sessions"):
+        root = profile.root / directory
+        require(not root.is_symlink(), "Codex rollout directory is a symlink. Stopped.")
+        if not root.is_dir():
+            continue
+        for path in root.rglob("rollout-*.jsonl*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            match = _ROLLOUT_NAME.fullmatch(path.name)
+            if match and match.group(1) in logical_ids:
+                paths.add(path)
+                versions.add(match.group(2) or match.group(1))
+    return versions, paths
+
+
+def _history_residual(profile: Profile, versions: set[str]) -> bool:
+    history = profile.root / "thread_history_1.sqlite"
+    if not history.is_file() or not versions:
+        return False
+    with database(history, profile.root) as db:
+        for table in ("thread_history_projection_state", "thread_turns", "thread_items"):
+            require(
+                "thread_id" in columns(db, table),
+                "Native Codex history index schema is unrecognized. Verification stopped.",
+            )
+            sequence = sorted(versions)
+            for index in range(0, len(sequence), 200):
+                items = sequence[index:index + 200]
+                args = ",".join("?" for _ in items)
+                if db.execute(
+                    f"SELECT 1 FROM {table} WHERE thread_id IN ({args}) LIMIT 1", items
+                ).fetchone():
+                    return True
+    return False
+
+
+def _reference_refusal(error: AppServerError) -> bool:
+    return (
+        error.code == -32600
+        and "forked history still references it" in str(error).lower()
     )
-    rows = {thread_id: current_rows[thread_id] for thread_id in closure}
-    return CodexDeletePlan(
-        requested_ids=tuple(requested_ids),
-        ordered_ids=tuple(ordered),
-        rows=rows,
-        parents={thread_id: parents.get(thread_id, frozenset()) for thread_id in closure},
+
+
+def execute_codex_delete_plan(
+    profile: Profile,
+    plan: CodexDeletePlan,
+    platform: PlatformAdapter,
+    *,
+    session_factory=AppServerSession,
+) -> CodexDeleteResult:
+    """Invoke only native thread/delete; isolate proven fork-reference refusals.
+
+    A timeout, unrecognized refusal, data change or incomplete native cleanup
+    stops the batch without guessing whether a destructive request completed.
+    """
+    try:
+        require_profile_stopped(platform, profile)
+    except PlatformError as error:
+        raise SafetyError(str(error)) from error
+    verified: set[str] = set()
+    calls: list[str] = []
+    refused: dict[str, str] = dict(plan.protected)
+    try:
+        with session_factory(profile, platform, timeout=15) as server:
+            rows, edges = _local_snapshot(profile)
+            states, native_edges = _official_inventory(server)
+            current = _build_plan(
+                plan.requested_ids, rows,
+                tuple(sorted(set(edges) | set(native_edges))), states,
+            )
+            require(
+                current == plan,
+                "Codex archived selection or spawned-thread state changed. Nothing was deleted.",
+            )
+            attempts = list(plan.root_ids)
+            # Retry only an explicit, deterministic fork-reference refusal after
+            # other targets were verified deleted. Never retry uncertain RPCs.
+            for pass_number in range(2):
+                progress = 0
+                pending: list[str] = []
+                for root in attempts:
+                    before, before_edges = _local_snapshot(profile)
+                    if root not in before:
+                        require(
+                            root in verified,
+                            "A planned Codex thread vanished unexpectedly. Stopped.",
+                        )
+                        refused.pop(root, None)
+                        continue
+                    require(
+                        before[root] == plan.rows[root],
+                        "A selected Codex thread changed. Remaining work stopped.",
+                    )
+                    expected = ({root} | set(plan.descendants_by_root[root])) & set(before)
+                    require(
+                        all(
+                            before[item] == plan.rows[item] and before[item].get("archived") == 1
+                            for item in expected
+                        ),
+                        "A native spawned descendant changed. Remaining work stopped.",
+                    )
+                    versions, _ = _rollout_versions(profile, expected)
+                    calls.append(root)
+                    try:
+                        server.delete_thread(root)
+                    except AppServerError as error:
+                        if _reference_refusal(error):
+                            refused_rows, refused_edges = _local_snapshot(profile)
+                            require(
+                                refused_rows == before and refused_edges == before_edges,
+                                "Official Codex refused deletion but local state changed. "
+                                "Remaining work stopped.",
+                            )
+                            refused[root] = "Official Codex protects referenced fork history"
+                            pending.append(root)
+                            continue
+                        raise
+                    after, after_edges = _local_snapshot(profile)
+                    removed = set(before) - set(after)
+                    require(
+                        removed == expected,
+                        "Native Codex reported success but removed an unexpected set of threads. Stopped.",
+                    )
+                    _, remaining_files = _rollout_versions(profile, expected)
+                    require(
+                        not remaining_files and not _history_residual(profile, versions),
+                        "Native Codex left rollout/history records after reporting success. "
+                        "No direct repair was attempted.",
+                    )
+                    require(
+                        not any(parent in expected or child in expected for parent, child, _ in after_edges),
+                        "Native Codex left spawned-thread index entries after deletion. "
+                        "No direct repair was attempted.",
+                    )
+                    verified.update(removed)
+                    progress += len(removed)
+                    refused.pop(root, None)
+                if pass_number or not pending or not progress:
+                    break
+                attempts = pending
+    except (PlatformError, AppServerError, SafetyError, sqlite3.Error, OSError) as error:
+        raise SafetyError(
+            f"Official Codex deletion stopped; {len(verified)} chat(s) were verified removed. "
+            "Recheck the profile before another attempt. "
+            f"{error}"
+        ) from error
+
+    return CodexDeleteResult(
+        deleted_ids=tuple(sorted(verified)),
+        native_calls=tuple(calls),
+        protected=refused,
     )
 
 
@@ -278,90 +423,14 @@ def delete_archived_codex(
     platform: PlatformAdapter,
     *,
     session_factory=AppServerSession,
-) -> CodexDeletePlan:
+) -> CodexDeleteResult:
     try:
         require_profile_stopped(platform, profile)
     except PlatformError as error:
         raise SafetyError(str(error)) from error
-
     plan = preview_codex_delete(
-        profile,
-        selected,
-        platform,
-        session_factory=session_factory,
+        profile, selected, platform, session_factory=session_factory,
     )
-    execute_codex_delete_plan(
-        profile,
-        plan,
-        platform,
-        session_factory=session_factory,
+    return execute_codex_delete_plan(
+        profile, plan, platform, session_factory=session_factory,
     )
-    return plan
-
-
-def execute_codex_delete_plan(
-    profile: Profile,
-    plan: CodexDeletePlan,
-    platform: PlatformAdapter,
-    *,
-    session_factory=AppServerSession,
-) -> None:
-    try:
-        require_profile_stopped(platform, profile)
-    except PlatformError as error:
-        raise SafetyError(str(error)) from error
-
-    completed: list[str] = []
-    try:
-        with session_factory(profile, platform, timeout=15) as appserver:
-            # Rebuild the dependency view after the user's final confirmation
-            # and before the first irreversible call. A new hidden fork or an
-            # archive-state change must invalidate the entire preview rather
-            # than being discovered halfway through deletion.
-            current_rows = {row["id"]: row for row in sessions(profile)}
-            for thread_id, preview_row in plan.rows.items():
-                require(
-                    current_rows.get(thread_id) == preview_row,
-                    "A Codex chat changed after the delete preview. Nothing was deleted.",
-                )
-            app_rows = _list_appserver_threads(appserver)
-            current_parents, current_app_archived = _dependency_map(
-                profile,
-                current_rows,
-                app_rows,
-            )
-            current_closure, current_order = _closure_and_order(
-                set(plan.requested_ids),
-                current_rows,
-                current_parents,
-                current_app_archived,
-            )
-            require(
-                current_closure == set(plan.rows)
-                and tuple(current_order) == plan.ordered_ids
-                and {
-                    thread_id: current_parents.get(thread_id, frozenset())
-                    for thread_id in current_closure
-                }
-                == plan.parents,
-                "Codex dependency state changed after preview. Nothing was deleted.",
-            )
-            for thread_id in plan.ordered_ids:
-                current = {row["id"]: row for row in sessions(profile)}.get(thread_id)
-                require(
-                    current == plan.rows[thread_id],
-                    "A Codex chat changed while deletion was in progress. Remaining work was stopped.",
-                )
-                appserver.delete_thread(thread_id)
-                remaining = any(row["id"] == thread_id for row in sessions(profile))
-                require(
-                    not remaining,
-                    "Codex reported deletion success but the chat still exists locally. Remaining work was stopped.",
-                )
-                completed.append(thread_id)
-    except (PlatformError, AppServerError, SafetyError) as error:
-        raise SafetyError(
-            f"Codex deletion stopped after {len(completed)} of {len(plan.ordered_ids)} "
-            "planned chat(s) were verified deleted. Review current state before retrying. "
-            f"{error}"
-        ) from error

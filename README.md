@@ -3,7 +3,7 @@
 An unofficial terminal utility for two deliberately separate jobs:
 
 1. reconcile and remove stale **local ChatGPT Desktop list entries** without deleting server-side ChatGPT conversations; and
-2. permanently delete selected **archived Codex conversations** through the official Codex app-server, including dependent archived forks when required.
+2. permanently delete selected **archived Codex conversations** through the official Codex app-server, allowing Codex itself to remove spawned subagents and associated history.
 
 It is not a bulk ChatGPT history deleter. Ordinary server-side ChatGPT deletion remains a ChatGPT UI action.
 
@@ -58,9 +58,10 @@ A one-file/one-icon utility is not inherently obsolete or suspicious. Trust come
 ## Run from source
 
 Python 3.11+ is required only when running from source.
-Python 3.14 has built-in Zstandard decoding. With Python 3.11–3.13,
-install the project's `zstandard` dependency using
-`python -m pip install -e .` before inspecting compressed Codex archives.
+No Zstandard decompression library is needed at runtime: Cleanup leaves
+compressed archive files and all physical deletion to the official Codex
+engine, and its local doctor checks file presence only. Some optional
+synthetic tests use Python 3.14's built-in decoder or `zstandard`.
 The macOS source launcher selects an available supported interpreter instead
 of using an outdated system `python3`.
 
@@ -156,13 +157,13 @@ The tool never force-terminates ChatGPT or arbitrary background processes. The o
 
 Archived Codex deletion is a separate engine:
 
-1. snapshot the selected archived rows from the local Codex state database;
-2. ask the official Codex app-server for active and archived thread inventory, including derived thread kinds;
-3. combine app-server `parentThreadId` / `forkedFromId` metadata with local rollout `session_meta` lineage, including the exact `*.jsonl.zst` archived replacement where available; compressed headers are read in memory, without altering the official Codex database or creating decompressed files;
-4. expand the plan to include dependent **archived** forks/children;
-5. stop before deletion if an active child/fork still depends on a selected parent;
-6. delete in child-before-parent order through official `thread/delete`;
-7. re-read local state after every deletion and stop on the first ambiguous result, reporting how many planned chats were already verified deleted. Failed/ambiguous deletes are never retried automatically.
+1. select the exact profile and archived logical thread IDs from the local Codex inventory, including children omitted by older upstream list filters;
+2. read the official app-server's **database-only** `thread/list` inventory and the small native `thread_spawn_edges` index; protect selected roots with active, unlisted or otherwise unresolved **spawned** descendants, since official deletion cascades to those descendants;
+3. collapse selected spawned children under their eligible parent so **one official `thread/delete` request** owns the whole spawned subtree. Cleanup does not decode fork history or implement physical file deletion to decide the result;
+4. keep independent archived threads eligible when another thread is protected. A confirmed upstream `-32600` fork-history-reference refusal protects just that thread; one bounded follow-up is allowed only if other deletions succeeded and may have removed the reference. Unknown errors and uncertain transport outcomes stop immediately and are **never** automatically retried;
+5. after each successful native response, verify that the expected logical threads, their native rollout versions (including compressed siblings), history projection entries, and spawn links are gone. This is **read-only auditing, not local repair**. If native deletion leaves residue, stop and report rather than manipulating OpenAI data directly.
+
+Deletion confirmation shows the maximum affected-thread count, the fewer official requests needed when subagents will cascade, and any preflight-protected roots. An active **user fork** may still reference the bytes of a protected archived original; only Codex's own reference scanner decides whether that original can be deleted. Forks are never silently deleted just because they share a parent with a selected thread.
 
 ## Multi-profile behavior
 
@@ -173,7 +174,7 @@ Several verified profiles: one operation can target multiple profiles. Each prof
 ## Safety boundary
 
 - A ChatGPT local catalog entry, a standalone/historical `missing_candidate` flag, `conversation_inaccessible` result, or Native-state absence is not proof that the server conversation was deleted. Uncertain rows require explicit manual review. Fresh Desktop reconciliation evidence is accepted only after a newer full pass completes, and only a row whose own observation sequence advanced while being marked missing can gain automatic local-cleanup confidence; `conversation_inaccessible` remains protected.
-- Native Codex history/lineage, authentication and provider tables are never rewritten directly. Archived Codex deletion delegates the irreversible operation to official app-server `thread/delete` and uses local state only for preview, dependency planning and verification.
+- Native Codex history/lineage, authentication and provider tables are never rewritten directly. Archived Codex deletion delegates **all deletion and file/index cleanup** to official app-server `thread/delete`; the utility only selects, guards active spawned descendants, isolates confirmed refusals and audits native results. Log traces, cloud-side retention and files generated in project worktrees are outside the local thread-delete guarantee.
 - Direct catalog mutation requires an exact known schema and a platform/build write gate.
 - Preview changes, profile/account mismatch, unknown schemas/builds, symlinks, recovery conflicts and ambiguous request/command results stop the operation.
 - The affected ChatGPT/Codex profile data must not be in use during destructive operations. The optional live read-only scan may run while ChatGPT is open. An approved local cleanup can request a normal quit of a verified standalone official macOS app, but never forces external runtimes to stop. A supported fresh reconciliation similarly requires a brief stop while only its scheduling/scratch state is reset, then launches the verified Desktop where supported so Desktop itself performs the authenticated network reconciliation. For archived deletion, the utility starts its own short-lived official Codex app-server over stdio after the affected profile is closed and releases it by closing stdio when the operation ends.

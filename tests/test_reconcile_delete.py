@@ -19,7 +19,7 @@ from chatgpt_cleanup.codex_delete import (
 from chatgpt_cleanup.core import SafetyError, sessions
 from chatgpt_cleanup.desktop_probe import Presence
 from chatgpt_cleanup.evidence import DesktopFailureEvidence
-from chatgpt_cleanup.__main__ import choose_cleanup_assessments, doctor_data
+from chatgpt_cleanup.__main__ import _batch_summary, choose_cleanup_assessments, doctor_data
 from chatgpt_cleanup.__main__ import _parse_number_selection
 from chatgpt_cleanup.profiles import Profile
 from chatgpt_cleanup.reconcile import ReconcileStatus, assess_catalog_rows
@@ -42,10 +42,11 @@ class DeletePlatform:
 
 
 class FakeAppServer:
-    def __init__(self, *, app_rows=None, delete_callback=None, fail_on=None, calls=None):
+    def __init__(self, *, app_rows=None, delete_callback=None, fail_on=None, failures=None, calls=None):
         self.app_rows = list(app_rows or [])
         self.delete_callback = delete_callback
         self.fail_on = fail_on
+        self.failures = failures or {}
         self.calls = calls if calls is not None else []
 
     def __enter__(self):
@@ -60,6 +61,8 @@ class FakeAppServer:
 
     def delete_thread(self, thread_id):
         self.calls.append(thread_id)
+        if thread_id in self.failures:
+            raise self.failures[thread_id]
         if thread_id == self.fail_on:
             raise AppServerError("synthetic delete failure", code=-32600)
         if self.delete_callback is not None:
@@ -83,9 +86,16 @@ class ReconcileAndDeleteTests(unittest.TestCase):
                 "id TEXT PRIMARY KEY,title TEXT,archived INTEGER,updated_at INTEGER,"
                 "rollout_path TEXT)"
             )
+            db.execute(
+                "CREATE TABLE thread_spawn_edges("
+                "parent_thread_id TEXT,child_thread_id TEXT,status TEXT)"
+            )
         db.close()
 
-    def add_thread(self, thread_id: str, *, archived: int, parent: str | None = None):
+    def add_thread(
+        self, thread_id: str, *, archived: int,
+        parent: str | None = None, spawn_parent: str | None = None,
+    ):
         rollout = self.root / "sessions" / f"{thread_id}.jsonl"
         rollout.parent.mkdir(exist_ok=True)
         payload = {"id": thread_id}
@@ -101,12 +111,39 @@ class ReconcileAndDeleteTests(unittest.TestCase):
                 "INSERT INTO threads VALUES(?,?,?,?,?)",
                 (thread_id, thread_id, archived, 1, str(rollout)),
             )
+            if spawn_parent is not None:
+                db.execute(
+                    "INSERT INTO thread_spawn_edges VALUES(?,?,?)",
+                    (spawn_parent, thread_id, "open"),
+                )
         db.close()
 
     def delete_db_row(self, thread_id: str):
         db = sqlite3.connect(self.root / "state_5.sqlite")
+        pending = [thread_id]
+        all_ids = set()
+        while pending:
+            target = pending.pop()
+            if target in all_ids:
+                continue
+            all_ids.add(target)
+            pending.extend(
+                r[0] for r in db.execute(
+                    "SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id=?",
+                    (target,),
+                )
+            )
         with db:
-            db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
+            for target in all_ids:
+                row = db.execute("SELECT rollout_path FROM threads WHERE id=?", (target,)).fetchone()
+                if row:
+                    Path(row[0]).unlink(missing_ok=True)
+                    Path(row[0] + ".zst").unlink(missing_ok=True)
+                db.execute("DELETE FROM threads WHERE id=?", (target,))
+                db.execute(
+                    "DELETE FROM thread_spawn_edges "
+                    "WHERE parent_thread_id=? OR child_thread_id=?", (target, target),
+                )
         db.close()
 
     def compress_rollout(self, thread_id: str) -> Path:
@@ -127,7 +164,7 @@ class ReconcileAndDeleteTests(unittest.TestCase):
 
     def test_compressed_archive_header_and_local_inventory_are_read_only(self):
         self.add_thread("archived-parent", archived=1)
-        self.add_thread("archived-child", archived=1, parent="archived-parent")
+        self.add_thread("archived-child", archived=1, spawn_parent="archived-parent")
         compressed = self.compress_rollout("archived-child")
         before = compressed.read_bytes()
         original_path = self.root / "sessions" / "archived-child.jsonl"
@@ -136,7 +173,9 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             self.profile, selected, self.platform,
             session_factory=self.factory(FakeAppServer()),
         )
-        self.assertEqual(plan.ordered_ids, ("archived-child", "archived-parent"))
+        self.assertEqual(plan.root_ids, ("archived-parent",))
+        self.assertEqual(plan.affected_ids, {"archived-child", "archived-parent"})
+        self.assertEqual(plan.dependent_ids, ("archived-child",))
         data = doctor_data(self.profile, self.platform)
         self.assertEqual(data["archived_rollout_files_found"], 2)
         self.assertEqual(data["archived_compressed_rollouts"], 1)
@@ -144,18 +183,20 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         self.assertEqual(compressed.read_bytes(), before)
         self.assertFalse(original_path.exists())
 
-    def test_compressed_rollout_rejects_wrong_session_identity(self):
+    def test_native_delete_is_not_reimplemented_by_parsing_compressed_headers(self):
         self.add_thread("thread-a", archived=1)
         self.add_thread("thread-b", archived=1)
         compressed = self.compress_rollout("thread-a")
         other = self.compress_rollout("thread-b")
         compressed.write_bytes(other.read_bytes())
         selected = [row for row in sessions(self.profile) if row["id"] == "thread-a"]
-        with self.assertRaisesRegex(SafetyError, "does not belong to the selected thread"):
-            preview_codex_delete(
-                self.profile, selected, self.platform,
-                session_factory=self.factory(FakeAppServer()),
-            )
+        plan = preview_codex_delete(
+            self.profile, selected, self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.root_ids, ("thread-a",))
+        # The official backend, rather than Cleanup's own rollout parser,
+        # decides if this malformed archive can safely be deleted.
 
     def test_compressed_rollout_never_guesses_uuid_matches_elsewhere(self):
         self.add_thread("thread-a", archived=1)
@@ -166,15 +207,22 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "rollout path could not be verified"):
             verified_rollout_path(self.profile, row)
 
-    def test_corrupt_compressed_rollout_stops_planning(self):
+    def test_corrupt_compressed_rollout_is_left_to_official_delete(self):
         self.add_thread("thread-a", archived=1)
         compressed = self.compress_rollout("thread-a")
         compressed.write_bytes(b"not a zstd frame")
-        with self.assertRaisesRegex(SafetyError, "header could not be read"):
-            preview_codex_delete(
-                self.profile, sessions(self.profile), self.platform,
-                session_factory=self.factory(FakeAppServer()),
+        plan = preview_codex_delete(
+            self.profile, sessions(self.profile), self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.root_ids, ("thread-a",))
+        server = FakeAppServer(fail_on="thread-a")
+        with self.assertRaisesRegex(SafetyError, "synthetic delete failure"):
+            execute_codex_delete_plan(
+                self.profile, plan, self.platform,
+                session_factory=self.factory(server),
             )
+        self.assertEqual([row["id"] for row in sessions(self.profile)], ["thread-a"])
 
     def factory(self, server: FakeAppServer):
         return lambda *args, **kwargs: server
@@ -266,9 +314,9 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         )
         self.assertTrue(all(not item.selectable for item in assessed))
 
-    def test_codex_delete_plan_includes_hidden_archived_fork_child_first(self):
+    def test_native_delete_one_parent_cascades_to_hidden_spawned_child(self):
         self.add_thread("parent", archived=1)
-        self.add_thread("child", archived=1, parent="parent")
+        self.add_thread("child", archived=1, spawn_parent="parent")
         selected = [row for row in sessions(self.profile) if row["id"] == "parent"]
         server = FakeAppServer(app_rows=[])
         plan = preview_codex_delete(
@@ -279,7 +327,8 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         )
         self.assertEqual(plan.requested_ids, ("parent",))
         self.assertEqual(plan.dependent_ids, ("child",))
-        self.assertEqual(plan.ordered_ids, ("child", "parent"))
+        self.assertEqual(plan.root_ids, ("parent",))
+        self.assertEqual(plan.affected_ids, {"parent", "child"})
 
     def test_codex_delete_ignores_internal_paginated_history_base(self):
         self.add_thread("original", archived=1, parent="original")
@@ -291,24 +340,24 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             session_factory=self.factory(FakeAppServer()),
         )
         self.assertEqual(plan.requested_ids, ("original",))
-        self.assertEqual(plan.ordered_ids, ("original",))
+        self.assertEqual(plan.root_ids, ("original",))
         self.assertEqual(plan.dependent_ids, ())
 
     def test_codex_delete_blocks_active_dependent_child(self):
         self.add_thread("parent", archived=1)
-        self.add_thread("child", archived=0, parent="parent")
+        self.add_thread("child", archived=0, spawn_parent="parent")
         selected = [row for row in sessions(self.profile) if row["id"] == "parent"]
-        with self.assertRaisesRegex(SafetyError, "active Codex child/fork"):
-            preview_codex_delete(
-                self.profile,
-                selected,
-                self.platform,
-                session_factory=self.factory(FakeAppServer()),
-            )
+        plan = preview_codex_delete(
+            self.profile, selected, self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.root_ids, ())
+        self.assertIn("parent", plan.protected)
+        self.assertEqual(plan.affected_ids, frozenset())
 
     def test_codex_delete_rejects_nonarchived_requested_thread(self):
         self.add_thread("active", archived=0)
-        with self.assertRaisesRegex(SafetyError, "Only archived Codex chats"):
+        with self.assertRaisesRegex(SafetyError, "selected Codex chat changed after review"):
             preview_codex_delete(
                 self.profile,
                 sessions(self.profile),
@@ -316,7 +365,7 @@ class ReconcileAndDeleteTests(unittest.TestCase):
                 session_factory=self.factory(FakeAppServer()),
             )
 
-    def test_codex_delete_uses_appserver_parent_metadata_when_rollout_has_none(self):
+    def test_codex_delete_uses_native_spawn_metadata_when_db_edge_is_missing(self):
         self.add_thread("parent", archived=1)
         self.add_thread("child", archived=1)
         selected = [row for row in sessions(self.profile) if row["id"] == "parent"]
@@ -337,9 +386,10 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             self.platform,
             session_factory=self.factory(server),
         )
-        self.assertEqual(plan.ordered_ids, ("child", "parent"))
+        self.assertEqual(plan.root_ids, ("parent",))
+        self.assertEqual(plan.affected_ids, {"parent", "child"})
 
-    def test_codex_delete_blocks_appserver_only_dependent_child(self):
+    def test_codex_delete_protects_unknown_appserver_only_spawned_child(self):
         self.add_thread("parent", archived=1)
         selected = sessions(self.profile)
         server = FakeAppServer(
@@ -352,15 +402,14 @@ class ReconcileAndDeleteTests(unittest.TestCase):
                 },
             ]
         )
-        with self.assertRaisesRegex(SafetyError, "missing from the local database snapshot"):
-            preview_codex_delete(
-                self.profile,
-                selected,
-                self.platform,
-                session_factory=self.factory(server),
-            )
+        plan = preview_codex_delete(
+            self.profile, selected, self.platform,
+            session_factory=self.factory(server),
+        )
+        self.assertEqual(plan.root_ids, ())
+        self.assertIn("parent", plan.protected)
 
-    def test_codex_delete_blocks_when_rollout_lineage_cannot_be_read(self):
+    def test_native_delete_does_not_block_on_missing_rollout_header(self):
         self.add_thread("parent", archived=1)
         self.add_thread("other", archived=1)
         db = sqlite3.connect(self.root / "state_5.sqlite")
@@ -371,17 +420,16 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             )
         db.close()
         selected = [row for row in sessions(self.profile) if row["id"] == "parent"]
-        with self.assertRaisesRegex(SafetyError, "rollout path could not be verified"):
-            preview_codex_delete(
-                self.profile,
-                selected,
-                self.platform,
-                session_factory=self.factory(FakeAppServer()),
-            )
+        plan = preview_codex_delete(
+            self.profile, selected, self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.root_ids, ("parent",))
+        # The official Codex backend owns its missing-file semantics.
 
     def test_codex_delete_appserver_active_child_overrides_stale_archived_db_flag(self):
         self.add_thread("parent", archived=1)
-        self.add_thread("child", archived=1, parent="parent")
+        self.add_thread("child", archived=1, spawn_parent="parent")
         selected = [row for row in sessions(self.profile) if row["id"] == "parent"]
         server = FakeAppServer(
             app_rows=[
@@ -389,17 +437,16 @@ class ReconcileAndDeleteTests(unittest.TestCase):
                 {"id": "child", "archived": False, "parentThreadId": "parent"},
             ]
         )
-        with self.assertRaisesRegex(SafetyError, "active Codex child/fork"):
-            preview_codex_delete(
-                self.profile,
-                selected,
-                self.platform,
-                session_factory=self.factory(server),
-            )
+        plan = preview_codex_delete(
+            self.profile, selected, self.platform,
+            session_factory=self.factory(server),
+        )
+        self.assertIn("parent", plan.protected)
+        self.assertEqual(plan.root_ids, ())
 
-    def test_codex_delete_executes_child_first_and_verifies_each_row(self):
+    def test_codex_delete_delegates_spawned_cascade_to_one_native_request(self):
         self.add_thread("parent", archived=1)
-        self.add_thread("child", archived=1, parent="parent")
+        self.add_thread("child", archived=1, spawn_parent="parent")
         selected = [row for row in sessions(self.profile) if row["id"] == "parent"]
         preview = preview_codex_delete(
             self.profile,
@@ -412,13 +459,15 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             calls=calls,
             delete_callback=self.delete_db_row,
         )
-        execute_codex_delete_plan(
+        result = execute_codex_delete_plan(
             self.profile,
             preview,
             self.platform,
             session_factory=self.factory(server),
         )
-        self.assertEqual(calls, ["child", "parent"])
+        self.assertEqual(calls, ["parent"])
+        self.assertEqual(set(result.deleted_ids), {"parent", "child"})
+        self.assertEqual(result.native_calls, ("parent",))
         self.assertEqual(sessions(self.profile), [])
 
     def test_codex_delete_revalidates_dependencies_before_first_delete(self):
@@ -430,10 +479,10 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             self.platform,
             session_factory=self.factory(FakeAppServer()),
         )
-        self.add_thread("new-active-child", archived=0, parent="parent")
+        self.add_thread("new-active-child", archived=0, spawn_parent="parent")
         calls = []
         server = FakeAppServer(calls=calls, delete_callback=self.delete_db_row)
-        with self.assertRaisesRegex(SafetyError, "0 of 1 planned chat"):
+        with self.assertRaisesRegex(SafetyError, r"0 chat\(s\) were verified removed"):
             execute_codex_delete_plan(
                 self.profile,
                 preview,
@@ -454,7 +503,7 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         )
         calls = []
         server = FakeAppServer(calls=calls, fail_on="parent")
-        with self.assertRaisesRegex(SafetyError, "0 of 1 planned chat"):
+        with self.assertRaisesRegex(SafetyError, r"0 chat\(s\) were verified removed"):
             execute_codex_delete_plan(
                 self.profile,
                 preview,
@@ -463,6 +512,306 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             )
         self.assertEqual(calls, ["parent"])
         self.assertEqual(len(sessions(self.profile)), 1)
+
+
+    def test_native_refusal_is_isolated_with_one_bounded_second_pass(self):
+        self.add_thread("protected", archived=1)
+        self.add_thread("free", archived=1)
+        plan = preview_codex_delete(
+            self.profile, [
+                row for id in ("protected", "free")
+                for row in sessions(self.profile) if row["id"] == id
+            ], self.platform, session_factory=self.factory(FakeAppServer()),
+        )
+        calls = []
+        server = FakeAppServer(
+            calls=calls,
+            failures={"protected": AppServerError(
+                "cannot delete thread: forked history still references it", code=-32600,
+            )},
+            delete_callback=self.delete_db_row,
+        )
+        outcome = execute_codex_delete_plan(
+            self.profile, plan, self.platform,
+            session_factory=self.factory(server),
+        )
+        self.assertEqual(calls, ["protected", "free", "protected"])
+        self.assertEqual(outcome.deleted_ids, ("free",))
+        self.assertIn("protected", outcome.protected)
+        self.assertEqual({r["id"] for r in sessions(self.profile)}, {"protected"})
+
+    def test_native_reference_refusal_without_progress_is_not_retried(self):
+        self.add_thread("protected", archived=1)
+        plan = preview_codex_delete(
+            self.profile, sessions(self.profile), self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        calls = []
+        server = FakeAppServer(
+            calls=calls,
+            failures={"protected": AppServerError(
+                "cannot delete thread: forked history still references it", code=-32600,
+            )},
+        )
+        outcome = execute_codex_delete_plan(
+            self.profile, plan, self.platform,
+            session_factory=self.factory(server),
+        )
+        self.assertEqual(calls, ["protected"])
+        self.assertEqual(outcome.deleted_ids, ())
+        self.assertIn("protected", outcome.protected)
+
+    def test_reference_refusal_resolves_after_native_removes_archived_fork(self):
+        self.add_thread("parent", archived=1)
+        self.add_thread("fork", archived=1, parent="parent")
+        plan = preview_codex_delete(
+            self.profile, [
+                row for id in ("parent", "fork")
+                for row in sessions(self.profile) if row["id"] == id
+            ], self.platform, session_factory=self.factory(FakeAppServer()),
+        )
+        test_case = self
+
+        class NativeReferenceServer(FakeAppServer):
+            def delete_thread(self, thread_id):
+                if thread_id == "parent" and any(
+                    r["id"] == "fork" for r in sessions(test_case.profile)
+                ):
+                    self.calls.append(thread_id)
+                    raise AppServerError(
+                        "cannot delete thread: forked history still references it",
+                        code=-32600,
+                    )
+                super().delete_thread(thread_id)
+
+        calls = []
+        outcome = execute_codex_delete_plan(
+            self.profile, plan, self.platform,
+            session_factory=self.factory(
+                NativeReferenceServer(calls=calls, delete_callback=self.delete_db_row)
+            ),
+        )
+        self.assertEqual(calls, ["parent", "fork", "parent"])
+        self.assertEqual(set(outcome.deleted_ids), {"parent", "fork"})
+        self.assertEqual(outcome.protected, {})
+        self.assertEqual(sessions(self.profile), [])
+
+    def test_active_spawned_child_blocks_only_its_parent(self):
+        self.add_thread("blocked", archived=1)
+        self.add_thread("active-worker", archived=0, spawn_parent="blocked")
+        self.add_thread("free", archived=1)
+        chosen = [r for r in sessions(self.profile) if r["archived"] == 1]
+        plan = preview_codex_delete(
+            self.profile, chosen, self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.root_ids, ("free",))
+        self.assertIn("blocked", plan.protected)
+        calls = []
+        outcome = execute_codex_delete_plan(
+            self.profile, plan, self.platform,
+            session_factory=self.factory(
+                FakeAppServer(calls=calls, delete_callback=self.delete_db_row)
+            ),
+        )
+        self.assertEqual(calls, ["free"])
+        self.assertEqual(outcome.deleted_ids, ("free",))
+        self.assertEqual(
+            {r["id"] for r in sessions(self.profile)}, {"blocked", "active-worker"},
+        )
+
+    def test_selected_spawned_child_uses_only_one_parent_native_call(self):
+        self.add_thread("parent", archived=1)
+        self.add_thread("child", archived=1, spawn_parent="parent")
+        plan = preview_codex_delete(
+            self.profile, [
+                row for id in ("parent", "child")
+                for row in sessions(self.profile) if row["id"] == id
+            ], self.platform, session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.root_ids, ("parent",))
+        calls = []
+        outcome = execute_codex_delete_plan(
+            self.profile, plan, self.platform,
+            session_factory=self.factory(
+                FakeAppServer(calls=calls, delete_callback=self.delete_db_row)
+            ),
+        )
+        self.assertEqual(calls, ["parent"])
+        self.assertEqual(set(outcome.deleted_ids), {"parent", "child"})
+
+    def test_delete_confirmation_explains_native_cascade_and_protection(self):
+        self.add_thread("parent", archived=1)
+        self.add_thread("spawned-child", archived=1, spawn_parent="parent")
+        self.add_thread("protected", archived=1)
+        self.add_thread("active-worker", archived=0, spawn_parent="protected")
+        selected = [row for row in sessions(self.profile) if row["archived"] == 1]
+        plan = preview_codex_delete(
+            self.profile, selected, self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        output = io.StringIO()
+        with (
+            patch("builtins.input", return_value="DELETE 2 CHATS"),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertTrue(
+                _batch_summary(
+                    "delete", [(self.profile, selected)],
+                    delete_plans={self.profile.id: plan},
+                )
+            )
+        self.assertIn("1 official delete request", output.getvalue())
+        self.assertIn("1 selected parent(s) protected", output.getvalue())
+        self.assertIn("does not delete Codex files directly", output.getvalue())
+
+    def test_native_success_with_rollout_residue_is_not_claimed_clean(self):
+        thread_id = "00000000-0000-0000-0000-000000000001"
+        self.add_thread(thread_id, archived=1)
+        old = self.root / "sessions" / (thread_id + ".jsonl")
+        new = self.root / "archived_sessions" / (
+            "rollout-2026-10-21T12-00-00-" + thread_id + ".jsonl"
+        )
+        new.parent.mkdir(exist_ok=True)
+        old.rename(new)
+        db = sqlite3.connect(self.root / "state_5.sqlite")
+        with db:
+            db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(new), thread_id))
+        db.close()
+        plan = preview_codex_delete(
+            self.profile, sessions(self.profile), self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+
+        def delete_only_row(target):
+            db = sqlite3.connect(self.root / "state_5.sqlite")
+            with db:
+                db.execute("DELETE FROM threads WHERE id=?", (target,))
+            db.close()
+
+        with self.assertRaisesRegex(SafetyError, "left rollout/history records"):
+            execute_codex_delete_plan(
+                self.profile, plan, self.platform,
+                session_factory=self.factory(
+                    FakeAppServer(delete_callback=delete_only_row)
+                ),
+            )
+        self.assertTrue(new.exists())
+
+    def test_uncertain_native_timeout_is_never_retried(self):
+        self.add_thread("target", archived=1)
+        plan = preview_codex_delete(
+            self.profile, sessions(self.profile), self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        calls = []
+        with self.assertRaisesRegex(SafetyError, "timeout after request"):
+            execute_codex_delete_plan(
+                self.profile, plan, self.platform,
+                session_factory=self.factory(
+                    FakeAppServer(
+                        calls=calls,
+                        failures={"target": AppServerError("timeout after request")},
+                    )
+                ),
+            )
+        self.assertEqual(calls, ["target"])
+        self.assertEqual(len(sessions(self.profile)), 1)
+
+
+    def test_native_history_projection_residue_is_reported_not_repaired(self):
+        thread_id = "00000000-0000-0000-0000-000000000002"
+        self.add_thread(thread_id, archived=1)
+        old = self.root / "sessions" / (thread_id + ".jsonl")
+        new = self.root / "archived_sessions" / (
+            "rollout-2026-10-21T12-00-00-" + thread_id + ".jsonl"
+        )
+        new.parent.mkdir(exist_ok=True)
+        old.rename(new)
+        db = sqlite3.connect(self.root / "state_5.sqlite")
+        with db:
+            db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(new), thread_id))
+        db.close()
+        history = sqlite3.connect(self.root / "thread_history_1.sqlite")
+        with history:
+            history.execute("CREATE TABLE thread_history_projection_state(thread_id TEXT)")
+            history.execute("CREATE TABLE thread_turns(thread_id TEXT)")
+            history.execute("CREATE TABLE thread_items(thread_id TEXT)")
+            history.execute(
+                "INSERT INTO thread_history_projection_state VALUES (?)", (thread_id,),
+            )
+        history.close()
+        plan = preview_codex_delete(
+            self.profile, sessions(self.profile), self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        with self.assertRaisesRegex(SafetyError, "left rollout/history records"):
+            execute_codex_delete_plan(
+                self.profile, plan, self.platform,
+                session_factory=self.factory(
+                    FakeAppServer(delete_callback=self.delete_db_row),
+                ),
+            )
+        history = sqlite3.connect(self.root / "thread_history_1.sqlite")
+        self.assertEqual(
+            history.execute("SELECT count(*) FROM thread_history_projection_state").fetchone()[0],
+            1,
+        )
+        history.close()
+
+    def test_unexpected_native_deletion_of_unselected_active_thread_stops(self):
+        self.add_thread("archived", archived=1)
+        self.add_thread("active", archived=0)
+        plan = preview_codex_delete(
+            self.profile,
+            [r for r in sessions(self.profile) if r["archived"] == 1],
+            self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+
+        def wrong_native_delete(thread_id):
+            self.delete_db_row(thread_id)
+            self.delete_db_row("active")
+
+        with self.assertRaisesRegex(SafetyError, "unexpected set of threads"):
+            execute_codex_delete_plan(
+                self.profile, plan, self.platform,
+                session_factory=self.factory(
+                    FakeAppServer(delete_callback=wrong_native_delete)
+                ),
+            )
+
+    def test_native_refusal_with_unexpected_data_change_stops_batch(self):
+        self.add_thread("protected", archived=1)
+        self.add_thread("free", archived=1)
+        plan = preview_codex_delete(
+            self.profile, [
+                r for id in ("protected", "free")
+                for r in sessions(self.profile) if r["id"] == id
+            ], self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        test_case = self
+
+        class BrokenNativeRefusal(FakeAppServer):
+            def delete_thread(self, thread_id):
+                self.calls.append(thread_id)
+                if thread_id == "protected":
+                    test_case.delete_db_row(thread_id)
+                    raise AppServerError(
+                        "cannot delete thread: forked history still references it",
+                        code=-32600,
+                    )
+                test_case.delete_db_row(thread_id)
+
+        calls = []
+        with self.assertRaisesRegex(SafetyError, "refused deletion but local state changed"):
+            execute_codex_delete_plan(
+                self.profile, plan, self.platform,
+                session_factory=self.factory(BrokenNativeRefusal(calls=calls)),
+            )
+        self.assertEqual(calls, ["protected"])
+        self.assertEqual({r["id"] for r in sessions(self.profile)}, {"free"})
 
 
 if __name__ == "__main__":

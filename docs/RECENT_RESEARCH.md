@@ -45,4 +45,14 @@ Recent official issue [`openai/codex#43106`](https://github.com/openai/codex/iss
 
 ### Resulting design
 
-Option 2 plans dependencies before any irreversible call. Local state DB rows, rollout lineage and official app-server parent/fork metadata are combined; archived dependents are included child-first, while active or unresolved dependencies stop the operation. The irreversible operation itself is delegated only to official app-server `thread/delete`, and each result is verified before proceeding.
+Option 2 was later simplified to **delegate the entire hard-delete and spawned
+subagent cascade** to official app-server `thread/delete`, rather than
+reimplementing fork/rollout dependency ordering. The tool only checks for active
+or unknown spawned descendants, collapses selected spawned families to one
+native call, isolates confirmed fork-reference refusals so other archived
+conversations can proceed, and verifies the resulting native storage state.
+Timeouts or ambiguous errors do not receive automatic retries. The official
+contract is documented in
+[`codex-rs/app-server/README.md`](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md),
+and the native reference rejection is implemented in
+[`thread-store/src/local/delete_thread.rs`](https://github.com/openai/codex/blob/main/codex-rs/thread-store/src/local/delete_thread.rs).

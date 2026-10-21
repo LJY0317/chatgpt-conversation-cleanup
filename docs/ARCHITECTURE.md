@@ -71,24 +71,57 @@ These bookkeeping steps mirror the current Desktop catalog's authoritative-remov
 
 ## 2. Archived Codex permanent deletion
 
-This engine performs an irreversible server/official-runtime operation and therefore uses a stricter plan/execute protocol.
+This engine fixes the usability failure where one undeletable archived conversation
+can stop the official application's entire bulk Delete. **It is an orchestration
+layer around Codex's native deletion engine, not another deletion engine.**
 
-### Inventory and dependency plan
+### Source of truth and deliberately small preview
 
-The preview combines:
+- The local `threads` table supplies the selected logical-thread IDs, including
+  empty-preview archived tasks that some upstream lists omit.
+- An official `thread/list` in database-only mode supplies an independent
+  positive veto when Codex reports a thread active, without requesting a
+  scan-and-repair of the Native profile.
+- The existing `thread_spawn_edges` index and the official `parentThreadId`
+  metadata are used **only** to identify the native API's spawned-child cascade
+  and protect active or unknown spawned descendants. This deliberately does
+  not reimplement fork lineage, paginated `history_base` interpretation,
+  archive-file compression, nor a custom physical delete routine.
+- Selecting a parent and its subagents produces **one** official delete call
+  for that eligible parent; Codex owns cascade traversal and removal of
+  associated rollouts/metadata. Independently selected children of a protected
+  parent can still be submitted if they themselves have no active spawn.
+- A fork is a separate user thread, not an automatically spawned subagent.
+  A live fork may depend on an archived original's byte history, and only
+  Codex's native reference protection can decide whether the original is
+  deletable. No attempt is made to detach or rewrite its history.
 
-- all local rows in `state_5.sqlite`;
-- official app-server `thread/list` results for active and archived threads, including derived source kinds;
-- rollout `session_meta` lineage (`history_base.thread_id` / fork metadata);
-- app-server `parentThreadId` and `forkedFromId` metadata.
+### Native execution and failure isolation
 
-The planner computes the descendant closure of the requested archived threads. Dependent archived children/forks are included automatically and ordered before their parents. An active dependent child, a dependency cycle, conflicting app-server state, or an app-server-only dependent missing from the local snapshot stops the operation before deletion.
+After the owner's final destructive confirmation, the exact local and native
+snapshots must still match the preview. Every operation passes the
+profile-scoped no-other-writers guard; neither the application nor external
+managers are force-closed. A short-lived, official, profile-bound app-server
+performs every irreversible `thread/delete`.
 
-### Official deletion only
+A **definitive** native `-32600` fork-history-reference refusal is reported for
+that thread while other independently selected archived roots continue. If
+another selected archived fork was then successfully removed, a single bounded
+second pass may attempt the previously refused root again. No other error
+is automatically retried: server timeouts, transport loss, unknown refusals,
+schema conflicts and partial/ambiguous outcomes stop immediately.
 
-Execution uses official app-server `thread/delete`; the utility does not rewrite Native Codex history/lineage tables directly. After the user's final confirmation and before the first irreversible call, the entire local/app-server dependency plan is rebuilt and must match the preview exactly.
+Cleanup checks the affected logical rows and spawn index after each success,
+and conducts **read-only** checks for remaining native rollout/version files
+and `thread_history_1.sqlite` projections. If residue remains after native
+success, it is reported as an upstream/incomplete-delete problem and the batch
+stops. Cleanup never touches the native SQLite rows, `.jsonl`, `.zst`, log
+traces or any app resources to fix it. The native contract does not promise
+to remove generated workspace files, OS backups or all remote log retention.
 
-Before every delete, the selected local row must still exactly match the preview snapshot. After every delete, the local state database must no longer contain the thread. The first app-server error, timeout, ambiguous result or local verification failure stops remaining work. Destructive calls are never retried automatically.
+The resulting user experience is **native-first, fail-closed, and version
+resilient**: small safety assertions and observable results, but no mirrored
+file-by-file deletion algorithm.
 
 ## Shared safety rules
 
