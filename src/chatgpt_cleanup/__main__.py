@@ -24,7 +24,7 @@ from .core import (
     restore_catalog,
     sessions,
 )
-from .codex_delete import execute_codex_delete_plan, preview_codex_delete
+from .codex_delete import execute_codex_delete_plan, preview_codex_delete, verified_rollout_path
 from .desktop_probe import Presence, probe_conversation_presence
 from .desktop_refresh import (
     desktop_catalog_refresh_progress,
@@ -1118,15 +1118,27 @@ def apply_batch(
 
 def doctor_data(profile, platform):
     rows = sessions(profile)
+    archived = [row for row in rows if row["archived"] == 1]
     data = {
         "profile_id": profile.id,
         "provider": profile.provider,
         "native_conversations": len(rows),
-        "archived_conversations": sum(row["archived"] == 1 for row in rows),
+        "archived_conversations": len(archived),
+        "archived_rollout_files_found": 0,
+        "archived_compressed_rollouts": 0,
+        "archived_rollout_files_missing": 0,
         "catalog_readable": False,
         "missing_chatgpt_entries": None,
         "local_orphans": None,
     }
+    for row in archived:
+        try:
+            path = verified_rollout_path(profile, row)
+            data["archived_rollout_files_found"] += 1
+            if path.suffix == ".zst":
+                data["archived_compressed_rollouts"] += 1
+        except (SafetyError, OSError):
+            data["archived_rollout_files_missing"] += 1
     try:
         entries = catalog(profile)
         data["catalog_readable"] = True
@@ -1156,6 +1168,16 @@ def doctor(profile, platform):
     print(f"\n{profile.display_name}")
     print(f"  Codex chats on this computer: {data['native_conversations']}")
     print(f"  Archived Codex chats: {data['archived_conversations']}")
+    print(
+        "  Local archived rollout files found: "
+        f"{data['archived_rollout_files_found']} "
+        f"({data['archived_compressed_rollouts']} compressed)"
+    )
+    if data["archived_rollout_files_missing"]:
+        print(
+            "  Archived rollout files unresolved: "
+            f"{data['archived_rollout_files_missing']} (read-only diagnostic)"
+        )
     if data["catalog_readable"]:
         print(f"  ChatGPT entries marked missing: {data['missing_chatgpt_entries']}")
         print(f"  Other local leftovers: {data['local_orphans']}")

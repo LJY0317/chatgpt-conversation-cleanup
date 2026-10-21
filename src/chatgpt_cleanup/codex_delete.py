@@ -27,18 +27,37 @@ def _rollout_parent_ids(profile: Profile, row: dict) -> set[str]:
     raw_path = row.get("rollout_path")
     if not isinstance(raw_path, str) or not raw_path:
         return set()
+    path = verified_rollout_path(profile, row)
     try:
-        path = safe_path(Path(raw_path), profile.root)
-    except (SafetyError, OSError) as error:
-        raise SafetyError(
-            "A Codex rollout path could not be verified. Dependency planning stopped."
-        ) from error
-    require(path.is_file(), "A Codex rollout is missing. Dependency planning stopped.")
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            first = stream.readline(256 * 1024)
+        # Inspect the bounded session_meta header. Codex may replace an
+        # archived .jsonl file with .jsonl.zst without rewriting rollout_path.
+        # Never unpack into the official profile or modify its database.
+        if path.suffix == ".zst":
+            try:
+                from compression import zstd  # Python 3.14+
+            except ImportError:
+                try:
+                    import zstandard as zstd  # Python 3.11-3.13
+                except ImportError as error:
+                    raise SafetyError(
+                        "A Zstandard decoder is required for compressed Codex rollouts. "
+                        "Dependency planning stopped."
+                    ) from error
+            stream = zstd.open(path, "rt", encoding="utf-8")
+        else:
+            stream = path.open("r", encoding="utf-8")
+        with stream:
+            first = stream.readline(256 * 1024 + 1)
+        require(
+            len(first) <= 256 * 1024,
+            "A Codex rollout header exceeded the safety limit. Dependency planning stopped.",
+        )
         record = json.loads(first)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+    except Exception as error:
+        if isinstance(error, SafetyError):
+            raise
+        # compression.zstd.ZstdError is not an OSError subclass. Treat a
+        # corrupt or truncated compressed header as a safe planning failure.
         raise SafetyError(
             "A Codex rollout header could not be read. Dependency planning stopped."
         ) from error
@@ -51,6 +70,10 @@ def _rollout_parent_ids(profile: Profile, row: dict) -> set[str]:
         isinstance(payload, dict),
         "A Codex rollout has invalid session metadata. Dependency planning stopped.",
     )
+    require(
+        payload.get("id") == row.get("id"),
+        "A Codex rollout does not belong to the selected thread. Dependency planning stopped.",
+    )
     parents: set[str] = set()
     forked = payload.get("forked_from_id")
     if isinstance(forked, str) and forked:
@@ -61,6 +84,31 @@ def _rollout_parent_ids(profile: Profile, row: dict) -> set[str]:
         if isinstance(parent, str) and parent:
             parents.add(parent)
     return parents
+
+
+def verified_rollout_path(profile: Profile, row: dict) -> Path:
+    """Resolve only the exact owned rollout path or its .jsonl.zst replacement.
+
+    No UUID scan, profile mutation or database repair occurs here. Unsafe and
+    missing paths are rejected before dependency planning can delete anything.
+    """
+    raw_path = row.get("rollout_path")
+    require(isinstance(raw_path, str) and bool(raw_path), "A Codex rollout path is missing.")
+    try:
+        path = safe_path(Path(raw_path), profile.root, must_exist=False)
+        if path.is_file():
+            return path
+        if path.suffix == ".jsonl":
+            compressed = safe_path(Path(str(path) + ".zst"), profile.root, must_exist=False)
+            if compressed.is_file():
+                return compressed
+    except (SafetyError, OSError) as error:
+        raise SafetyError(
+            "A Codex rollout path could not be verified. Dependency planning stopped."
+        ) from error
+    raise SafetyError(
+        "A Codex rollout path could not be verified. Dependency planning stopped."
+    )
 
 
 def _list_appserver_threads(session: AppServerSession) -> list[dict]:

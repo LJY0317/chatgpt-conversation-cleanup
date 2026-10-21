@@ -8,6 +8,7 @@ dynamic = ["version"]
 description = "Portable reconciliation utility for ChatGPT Desktop leftovers and archived Codex deletion."
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = ["zstandard>=0.23.0; python_version < '3.14'"]
 license = {file = "LICENSE"}
 authors = [{name = "LJY0317"}]
 classifiers = [

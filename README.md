@@ -58,6 +58,11 @@ A one-file/one-icon utility is not inherently obsolete or suspicious. Trust come
 ## Run from source
 
 Python 3.11+ is required only when running from source.
+Python 3.14 has built-in Zstandard decoding. With Python 3.11–3.13,
+install the project's `zstandard` dependency using
+`python -m pip install -e .` before inspecting compressed Codex archives.
+The macOS source launcher selects an available supported interpreter instead
+of using an outdated system `python3`.
 
 macOS: double-click `ChatGPT Cleanup.command`, or run:
 
@@ -82,6 +87,11 @@ python3 run.py --version
 ~~~
 
 The JSON doctor output intentionally excludes conversation titles, bodies, email addresses, local paths and authentication data so it can be attached to bug reports more safely.
+
+Doctor also counts archived Codex rollout files found on disk, including
+`*.jsonl.zst` compressed archives. These local storage counts do **not**
+certify that the official Desktop archived-chats screen can load those chats.
+An inaccessible archived list is not evidence that the local archive was deleted.
 
 ## Everyday flow
 
@@ -148,7 +158,7 @@ Archived Codex deletion is a separate engine:
 
 1. snapshot the selected archived rows from the local Codex state database;
 2. ask the official Codex app-server for active and archived thread inventory, including derived thread kinds;
-3. combine app-server `parentThreadId` / `forkedFromId` metadata with local rollout `session_meta` lineage;
+3. combine app-server `parentThreadId` / `forkedFromId` metadata with local rollout `session_meta` lineage, including the exact `*.jsonl.zst` archived replacement where available; compressed headers are read in memory, without altering the official Codex database or creating decompressed files;
 4. expand the plan to include dependent **archived** forks/children;
 5. stop before deletion if an active child/fork still depends on a selected parent;
 6. delete in child-before-parent order through official `thread/delete`;

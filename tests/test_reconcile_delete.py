@@ -14,11 +14,12 @@ from chatgpt_cleanup.appserver import AppServerError
 from chatgpt_cleanup.codex_delete import (
     execute_codex_delete_plan,
     preview_codex_delete,
+    verified_rollout_path,
 )
 from chatgpt_cleanup.core import SafetyError, sessions
 from chatgpt_cleanup.desktop_probe import Presence
 from chatgpt_cleanup.evidence import DesktopFailureEvidence
-from chatgpt_cleanup.__main__ import choose_cleanup_assessments
+from chatgpt_cleanup.__main__ import choose_cleanup_assessments, doctor_data
 from chatgpt_cleanup.__main__ import _parse_number_selection
 from chatgpt_cleanup.profiles import Profile
 from chatgpt_cleanup.reconcile import ReconcileStatus, assess_catalog_rows
@@ -32,6 +33,12 @@ class DeletePlatform:
 
     def require_desktop_stopped(self):
         return None
+
+    def catalog_write_gate(self):
+        return False, "synthetic read-only test"
+
+    def profile_catalog_refresh_gate(self, profile):
+        return False, "synthetic read-only test"
 
 
 class FakeAppServer:
@@ -101,6 +108,73 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         with db:
             db.execute("DELETE FROM threads WHERE id=?", (thread_id,))
         db.close()
+
+    def compress_rollout(self, thread_id: str) -> Path:
+        rollout = self.root / "sessions" / f"{thread_id}.jsonl"
+        try:
+            from compression import zstd
+            compressed = zstd.compress(rollout.read_bytes())
+        except ImportError:
+            try:
+                import zstandard
+            except ImportError:
+                self.skipTest("Zstandard is unavailable on this interpreter")
+            compressed = zstandard.ZstdCompressor().compress(rollout.read_bytes())
+        dest = Path(str(rollout) + ".zst")
+        dest.write_bytes(compressed)
+        rollout.unlink()
+        return dest
+
+    def test_compressed_archive_header_and_local_inventory_are_read_only(self):
+        self.add_thread("archived-parent", archived=1)
+        self.add_thread("archived-child", archived=1, parent="archived-parent")
+        compressed = self.compress_rollout("archived-child")
+        before = compressed.read_bytes()
+        original_path = self.root / "sessions" / "archived-child.jsonl"
+        selected = [row for row in sessions(self.profile) if row["id"] == "archived-parent"]
+        plan = preview_codex_delete(
+            self.profile, selected, self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.ordered_ids, ("archived-child", "archived-parent"))
+        data = doctor_data(self.profile, self.platform)
+        self.assertEqual(data["archived_rollout_files_found"], 2)
+        self.assertEqual(data["archived_compressed_rollouts"], 1)
+        self.assertEqual(data["archived_rollout_files_missing"], 0)
+        self.assertEqual(compressed.read_bytes(), before)
+        self.assertFalse(original_path.exists())
+
+    def test_compressed_rollout_rejects_wrong_session_identity(self):
+        self.add_thread("thread-a", archived=1)
+        self.add_thread("thread-b", archived=1)
+        compressed = self.compress_rollout("thread-a")
+        other = self.compress_rollout("thread-b")
+        compressed.write_bytes(other.read_bytes())
+        selected = [row for row in sessions(self.profile) if row["id"] == "thread-a"]
+        with self.assertRaisesRegex(SafetyError, "does not belong to the selected thread"):
+            preview_codex_delete(
+                self.profile, selected, self.platform,
+                session_factory=self.factory(FakeAppServer()),
+            )
+
+    def test_compressed_rollout_never_guesses_uuid_matches_elsewhere(self):
+        self.add_thread("thread-a", archived=1)
+        original = self.root / "sessions" / "thread-a.jsonl"
+        compressed = self.compress_rollout("thread-a")
+        compressed.rename(self.root / "sessions" / "different-name.jsonl.zst")
+        row = sessions(self.profile)[0]
+        with self.assertRaisesRegex(SafetyError, "rollout path could not be verified"):
+            verified_rollout_path(self.profile, row)
+
+    def test_corrupt_compressed_rollout_stops_planning(self):
+        self.add_thread("thread-a", archived=1)
+        compressed = self.compress_rollout("thread-a")
+        compressed.write_bytes(b"not a zstd frame")
+        with self.assertRaisesRegex(SafetyError, "header could not be read"):
+            preview_codex_delete(
+                self.profile, sessions(self.profile), self.platform,
+                session_factory=self.factory(FakeAppServer()),
+            )
 
     def factory(self, server: FakeAppServer):
         return lambda *args, **kwargs: server
