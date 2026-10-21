@@ -817,30 +817,6 @@ class CleanupTests(unittest.TestCase):
             },
         )
 
-    def test_retire_installed_copy_preserves_recovery_and_is_symlink_safe(self):
-        platform = MacOSAdapter(home=self.home)
-        recovery = platform.recovery_root
-        recovery.mkdir(parents=True)
-        (recovery / "keep.json").write_text("{}")
-        tool = platform.data_root / "tool"
-        tool.mkdir()
-        (tool / "run.py").write_text("old")
-        launcher = self.home / "Applications/ChatGPT Conversation Cleanup.command"
-        launcher.parent.mkdir(parents=True)
-        launcher.write_text("old")
-
-        self.assertEqual(c.retire_installed_copy(platform), 2)
-        self.assertFalse(tool.exists())
-        self.assertFalse(launcher.exists())
-        self.assertTrue((recovery / "keep.json").exists())
-
-        outside = self.home / "outside-old-tool"
-        outside.mkdir()
-        tool.symlink_to(outside, target_is_directory=True)
-        with self.assertRaises(c.SafetyError):
-            c.retire_installed_copy(platform)
-        self.assertTrue(outside.exists())
-
     def test_product_data_purge_is_scoped_and_symlink_safe(self):
         platform = MacOSAdapter(home=self.home)
         data_root = platform.data_root

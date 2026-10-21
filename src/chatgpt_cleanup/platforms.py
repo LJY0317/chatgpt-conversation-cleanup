@@ -53,10 +53,6 @@ class PlatformAdapter:
     def recovery_root(self) -> Path:
         return self.data_root / "recovery"
 
-    @property
-    def legacy_program_paths(self) -> tuple[Path, ...]:
-        return ()
-
     def codex_cli(self) -> Path:
         override = os.environ.get("CHATGPT_CLEANUP_CODEX")
         if override:
@@ -107,15 +103,6 @@ class MacOSAdapter(PlatformAdapter):
     @property
     def data_root(self) -> Path:
         return self.home / "Library/Application Support/ChatGPT Conversation Cleanup"
-
-    @property
-    def legacy_program_paths(self) -> tuple[Path, ...]:
-        return (
-            self.data_root / "tool",
-            self.home / "Applications/ChatGPT Conversation Cleanup.command",
-            self.home / "Library/Application Support/ChatGPT Repair Kit/tool",
-            self.home / "Applications/ChatGPT Repair Kit.command",
-        )
 
     def desktop_restore_plan(self, profiles: list["Profile"]) -> dict[str, str]:
         """Identify only provable standalone app launches for automatic reopening.
@@ -442,13 +429,6 @@ class WindowsAdapter(PlatformAdapter):
         if not base:
             raise PlatformError("LOCALAPPDATA is unavailable.")
         return Path(base) / "ChatGPT Conversation Cleanup"
-
-    @property
-    def legacy_program_paths(self) -> tuple[Path, ...]:
-        return (
-            self.data_root / "tool",
-            self.data_root / "chatgpt-cleanup.cmd",
-        )
 
     def require_desktop_stopped(self) -> None:
         # CommandLine is required to distinguish the Codex app-server from ordinary CLI use.

@@ -19,7 +19,6 @@ from .core import (
     evict_catalog,
     maintain_recovery,
     purge_product_data,
-    retire_installed_copy,
     recovery_root,
     restore_catalog,
     sessions,
@@ -103,7 +102,8 @@ def show(rows, *, kind):
             updated = _date(row.get("source_updated_at"))
         suffix = f" · {updated}" if updated else ""
         print(f"{index:>4}. {display(title)}")
-        print(f"      {status}{suffix} · ID {display(str(ident)[:12])}…")
+        shown_id = str(ident) if kind == "archived" else str(ident)[:12] + "…"
+        print(f"      {status}{suffix} · ID {display(shown_id)}")
     if kind == "catalog":
         print(f"{len(rows)} local ChatGPT Desktop entr{'y' if len(rows) == 1 else 'ies'} shown for review.")
     else:
@@ -1256,23 +1256,6 @@ def recovery_menu(profile, platform):
             print("Undo point deleted.")
 
 
-def retire_install_interactive(platform):
-    print(
-        "This removes older installed copies of this app. "
-        "Your saved undo points are kept."
-    )
-    if input("Type [REMOVE OLD COPY] to continue: ").strip() != "REMOVE OLD COPY":
-        print("Cancelled. Nothing was removed.")
-        return False
-    removed = retire_installed_copy(platform)
-    print(
-        f"Removed {removed} old app item(s)."
-        if removed
-        else "No old installed copy was present."
-    )
-    return bool(removed)
-
-
 def purge_data_interactive(platform):
     print(
         "This deletes this app's saved undo points and other local app data. "
@@ -1318,9 +1301,8 @@ def interactive(platform, available):
         print("\nMore options\n")
         print("3 Check this computer")
         print("4 Undo a previous cleanup")
-        print("5 Remove an older installed copy")
-        print("6 Delete this app's saved local data")
-        more = input("\nChoose 3, 4, 5, or 6. Press Enter to go back: ").strip()
+        print("5 Delete this tool's saved local data")
+        more = input("\nChoose 3, 4, or 5. Press Enter to go back: ").strip()
         if not more:
             continue
         try:
@@ -1342,12 +1324,9 @@ def interactive(platform, available):
                 else:
                     recovery_menu(profiles[0], platform)
             elif more == "5":
-                retire_install_interactive(platform)
-            elif more == "6":
                 purge_data_interactive(platform)
-                print("Delete the portable app/executable to finish removing the program.")
             else:
-                print("Choose 3, 4, 5, or 6.")
+                print("Choose 3, 4, or 5.")
                 continue
         except (SafetyError, PlatformError, AppServerError) as error:
             print(f"\nCouldn’t continue: {error}")
@@ -1365,34 +1344,84 @@ def _resolve_cli_profiles(available, profile_id, all_profiles):
     return available if len(available) == 1 else [available[0]]
 
 
+def delete_archived_cli(profile, platform, *, ids, confirm=None):
+    """Exact-ID, TTY-free preview and owner-confirmed official deletion."""
+    archived = {row["id"]: row for row in sessions(profile) if row["archived"] == 1}
+    chosen = [item.strip() for item in ids.split(",")]
+    if (
+        not chosen or any(not item or item not in archived for item in chosen)
+        or len(set(chosen)) != len(chosen)
+    ):
+        raise SafetyError("Each --ids value must uniquely match an archived thread.")
+    plan = preview_codex_delete(profile, [archived[item] for item in chosen], platform)
+    count = len(plan.affected_ids)
+    print(
+        f"{profile.display_name}: {len(plan.requested_ids)} selected, "
+        f"{count} eligible thread(s), {len(plan.root_ids)} official request(s), "
+        f"{len(plan.protected)} protected."
+    )
+    for thread_id, reason in plan.protected.items():
+        print(f"  protected {thread_id}: {reason}")
+    if not count:
+        print("No eligible deletions. Nothing was changed.")
+        return
+    phrase = f"DELETE {count} CHATS"
+    if confirm is None:
+        print(f"Preview only. To execute, rerun with --confirm '{phrase}'.")
+        return
+    if confirm != phrase:
+        raise SafetyError("Confirmation does not match this preview. Nothing was deleted.")
+    with operation_lock(recovery_root(platform)):
+        result = execute_codex_delete_plan(profile, plan, platform)
+    print(
+        f"Official Codex verified {len(result.deleted_ids)} removed by "
+        f"{len(result.native_calls)} request(s); {len(result.protected)} protected."
+    )
+    for thread_id, reason in result.protected.items():
+        print(f"  protected {thread_id}: {reason}")
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(
         prog="chatgpt-cleanup",
         description="Safely inspect and clean stale ChatGPT Desktop conversation state.",
     )
-    parser.add_argument("command", nargs="?", choices=("doctor", "list-archived", "retire-install", "purge-data"))
+    parser.add_argument(
+        "command", nargs="?",
+        choices=("doctor", "list-archived", "delete-archived", "purge-data"),
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--profile")
     parser.add_argument("--all-profiles", action="store_true")
+    parser.add_argument("--ids", help="Exact archived thread IDs separated by commas.")
+    parser.add_argument("--confirm", help="Exact confirmation phrase from delete preview.")
     parser.add_argument(
         "--json",
         action="store_true",
         help="Emit privacy-safe machine-readable diagnostics (doctor only).",
     )
     args = parser.parse_args()
+    if args.command != "delete-archived" and (args.ids is not None or args.confirm is not None):
+        raise SafetyError("--ids and --confirm require delete-archived.")
     platform = current_platform()
-    if args.command in ("retire-install", "purge-data"):
+    if args.command == "purge-data":
         if args.json or args.profile or args.all_profiles:
             raise SafetyError(f"{args.command} does not accept profile or JSON options.")
-        if args.command == "retire-install":
-            retire_install_interactive(platform)
-        else:
-            purge_data_interactive(platform)
+        purge_data_interactive(platform)
         return
     available = discover_profiles(platform)
     if not available:
         raise SafetyError("No supported ChatGPT/Codex profile was found.")
+    if args.command == "delete-archived":
+        if not args.profile or args.all_profiles or args.json or not args.ids:
+            raise SafetyError(
+                "delete-archived requires --profile and exact --ids, "
+                "without --all-profiles or --json."
+            )
+        profile = _resolve_cli_profiles(available, args.profile, False)[0]
+        delete_archived_cli(profile, platform, ids=args.ids, confirm=args.confirm)
+        return
     if args.command:
         targets = _resolve_cli_profiles(available, args.profile, args.all_profiles)
         if args.command == "doctor":

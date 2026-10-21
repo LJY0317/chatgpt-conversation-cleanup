@@ -1,5 +1,20 @@
 # Architecture
 
+## Source-only operation
+
+The utility is a plain Python checkout, launched with `python3 run.py`
+without a packaging build. There are no bundled interpreters, macOS native
+launchers, frozen Windows executables or installers. Agents and humans use
+the same reviewed CLI/module functions and official Codex app-server API.
+CI runs source tests only and produces no program binaries.
+
+A terminal-less agent can obtain full archived IDs with `list-archived`,
+request a read-only `delete-archived --profile ... --ids ...` preview and,
+only with the owner's authorization, run the same command with the exact
+`--confirm "DELETE N CHATS"` phrase derived from that preview. There is no
+implicit all-threads deletion. The CLI calls the same native preview/execute
+functions, validates the selected profile and uses the normal operation lock.
+
 ChatGPT Conversation Cleanup contains two intentionally separate engines. They share profile discovery, locking, process guards and UI primitives, but they do **not** share a destructive decision model.
 
 ## 1. ChatGPT Desktop reconciliation
@@ -140,4 +155,9 @@ file-by-file deletion algorithm.
 - Local catalog cleanup presents the final selected-row confirmation before any optional normal-quit request. Cleanup still refuses a write while the affected profile's Desktop or app-server is active.
 - Archived Codex deletion deliberately never calls that local-catalog stop guard or Desktop restore/quit mechanism. The official app-server holds the deletion rules and thread writer-lock arbitration, while Cleanup checks exact selection and aftermath only.
 - Recovery data is private local state and is excluded from Git.
-- The automated suite uses synthetic homes only. A separate, expressly user-authorized one-per-profile manual acceptance test confirmed native deletion while both signed Desktop apps remained open; no additional pre-existing conversations may be used for destructive experiments without new authorization.
+- Automated tests use synthetic homes only. Specifically approved manual
+  experiments confirmed native subagent cascades, compressed archive deletion,
+  failure isolation and safe coexistence with running Desktop applications.
+  **Two archived originals remain protected because active forks depend on
+  their actual history.** Cleanup treats this as a native safety boundary,
+  never as an invitation to delete their files manually.

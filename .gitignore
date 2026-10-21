@@ -41,7 +41,7 @@ auth.json
 *.p12
 *.pfx
 
-# Local portable-build outputs.
+# Obsolete local build artifacts are ignored even though this is source-only.
 build/
 dist/
 *.spec

@@ -78,3 +78,19 @@ original PIDs. Pre-existing conversation IDs, private prompts, credentials
 and personal filesystem paths are intentionally excluded from this public
 research note. This validates the observed build/profile pair, not arbitrary
 future Codex versions or the Desktop's in-memory UI cache refresh behavior.
+
+### v0.4.6: Source-only agents and upstream deletion limits
+
+The owner chose to retire installers, native launchers and frozen executable
+builds. Agents can run the Python checkout directly through `run.py` and
+the existing reviewed Codex deletion functions. PyInstaller scripts, app
+bundles, portable-build CI and the legacy installation-retirement menu were
+removed. CI runs tests without producing downloadable binaries.
+
+Further expressly authorized live tests removed the remaining eligible
+archived conversations across both profiles, including spawned subagents and
+compressed history; read-only global audits found no orphan rollout or
+history-index entries. **Two archived originals in the primary profile remain
+undeletable** because active forked conversations reference their history
+bytes. This is correct native `thread/delete` protection. A custom
+fork-history rewrite or direct DB/file removal is not a safe workaround.

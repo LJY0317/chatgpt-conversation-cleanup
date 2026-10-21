@@ -236,22 +236,6 @@ def purge_product_data(platform: PlatformAdapter) -> bool:
     return True
 
 
-def retire_installed_copy(platform: PlatformAdapter) -> int:
-    removed = 0
-    for candidate in platform.legacy_program_paths:
-        path = safe_path(candidate, platform.home, must_exist=False)
-        if not path.exists():
-            continue
-        if path.is_dir():
-            shutil.rmtree(path)
-        elif path.is_file():
-            path.unlink()
-        else:
-            raise SafetyError("Legacy program path has an unsupported type.")
-        removed += 1
-    return removed
-
-
 def utc_now():
     return datetime.now(timezone.utc)
 

@@ -19,7 +19,9 @@ from chatgpt_cleanup.codex_delete import (
 from chatgpt_cleanup.core import SafetyError, sessions
 from chatgpt_cleanup.desktop_probe import Presence
 from chatgpt_cleanup.evidence import DesktopFailureEvidence
-from chatgpt_cleanup.__main__ import _batch_summary, choose_cleanup_assessments, doctor_data
+from chatgpt_cleanup.__main__ import (
+    _batch_summary, choose_cleanup_assessments, delete_archived_cli, doctor_data, main,
+)
 from chatgpt_cleanup.__main__ import _parse_number_selection
 from chatgpt_cleanup.profiles import Profile
 from chatgpt_cleanup.reconcile import ReconcileStatus, assess_catalog_rows
@@ -887,6 +889,70 @@ class ReconcileAndDeleteTests(unittest.TestCase):
             )
         self.assertEqual(calls, ["protected"])
         self.assertEqual({r["id"] for r in sessions(self.profile)}, {"free"})
+
+
+    def test_agent_delete_cli_previews_then_requires_exact_confirmation(self):
+        self.add_thread("archived", archived=1)
+        calls = []
+        fake = FakeAppServer(calls=calls, delete_callback=self.delete_db_row)
+
+        def preview(profile, selected, platform):
+            return preview_codex_delete(
+                profile, selected, platform,
+                session_factory=self.factory(FakeAppServer()),
+            )
+
+        def execute(profile, plan, platform):
+            return execute_codex_delete_plan(
+                profile, plan, platform, session_factory=self.factory(fake),
+            )
+
+        output = io.StringIO()
+        with (
+            patch("chatgpt_cleanup.__main__.preview_codex_delete", side_effect=preview),
+            patch("chatgpt_cleanup.__main__.execute_codex_delete_plan", side_effect=execute),
+            patch("chatgpt_cleanup.__main__.recovery_root", return_value=self.root),
+            patch("chatgpt_cleanup.__main__.operation_lock", return_value=contextlib.nullcontext()),
+            contextlib.redirect_stdout(output),
+        ):
+            delete_archived_cli(self.profile, self.platform, ids="archived")
+            self.assertEqual(calls, [])
+            self.assertEqual(len(sessions(self.profile)), 1)
+            with self.assertRaisesRegex(SafetyError, "Confirmation does not match"):
+                delete_archived_cli(
+                    self.profile, self.platform, ids="archived", confirm="DELETE 9 CHATS",
+                )
+            self.assertEqual(calls, [])
+            delete_archived_cli(
+                self.profile, self.platform, ids="archived", confirm="DELETE 1 CHATS",
+            )
+        self.assertIn("Preview only", output.getvalue())
+        self.assertEqual(calls, ["archived"])
+        self.assertEqual(sessions(self.profile), [])
+
+    def test_agent_delete_cli_rejects_unselected_and_duplicate_ids(self):
+        self.add_thread("archived", archived=1)
+        self.add_thread("active", archived=0)
+        for ids in ("", "missing", "active", "archived,archived", "archived,active"):
+            with self.subTest(ids=ids):
+                with self.assertRaisesRegex(SafetyError, "Each --ids value"):
+                    delete_archived_cli(self.profile, self.platform, ids=ids)
+        self.assertEqual(len(sessions(self.profile)), 2)
+
+    def test_agent_cli_can_parse_exact_profile_without_interactive_terminal(self):
+        with (
+            patch("sys.argv", [
+                "run.py", "delete-archived", "--profile", "default",
+                "--ids", "archived",
+            ]),
+            patch("chatgpt_cleanup.__main__.current_platform", return_value=self.platform),
+            patch("chatgpt_cleanup.__main__.discover_profiles", return_value=[self.profile]),
+            patch("chatgpt_cleanup.__main__.delete_archived_cli") as delete,
+        ):
+            main()
+            delete.assert_called_once_with(
+                self.profile, self.platform, ids="archived", confirm=None,
+            )
 
 
 if __name__ == "__main__":
