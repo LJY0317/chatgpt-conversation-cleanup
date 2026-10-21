@@ -81,7 +81,10 @@ def _rollout_parent_ids(profile: Profile, row: dict) -> set[str]:
     history_base = payload.get("history_base")
     if isinstance(history_base, dict):
         parent = history_base.get("thread_id")
-        if isinstance(parent, str) and parent:
+        # Paginated/reverted rollouts may reference a prior rollout of the
+        # same logical thread. That history version is internal to the thread,
+        # not a distinct dependent conversation to delete or a graph cycle.
+        if isinstance(parent, str) and parent and parent != row.get("id"):
             parents.add(parent)
     return parents
 

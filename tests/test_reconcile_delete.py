@@ -281,6 +281,19 @@ class ReconcileAndDeleteTests(unittest.TestCase):
         self.assertEqual(plan.dependent_ids, ("child",))
         self.assertEqual(plan.ordered_ids, ("child", "parent"))
 
+    def test_codex_delete_ignores_internal_paginated_history_base(self):
+        self.add_thread("original", archived=1, parent="original")
+        selected = sessions(self.profile)
+        plan = preview_codex_delete(
+            self.profile,
+            selected,
+            self.platform,
+            session_factory=self.factory(FakeAppServer()),
+        )
+        self.assertEqual(plan.requested_ids, ("original",))
+        self.assertEqual(plan.ordered_ids, ("original",))
+        self.assertEqual(plan.dependent_ids, ())
+
     def test_codex_delete_blocks_active_dependent_child(self):
         self.add_thread("parent", archived=1)
         self.add_thread("child", archived=0, parent="parent")
